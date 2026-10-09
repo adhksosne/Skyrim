@@ -172,12 +172,13 @@ void ResolveLanguage()
 std::filesystem::path GetPluginPath()
 {
 	HMODULE self = nullptr;
-	::GetModuleHandleExA(
+	::GetModuleHandleExW(
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		reinterpret_cast<LPCSTR>(&GetPluginPath),
+		reinterpret_cast<LPCWSTR>(&GetPluginPath),
 		&self);
-	char buf[MAX_PATH]{};
-	::GetModuleFileNameA(self, buf, static_cast<DWORD>(std::size(buf)));
+	// 用宽字符 API：Mod Organizer 的 mod 路径常含非 ASCII 字符
+	wchar_t buf[MAX_PATH]{};
+	::GetModuleFileNameW(self, buf, static_cast<DWORD>(std::size(buf)));
 	return { buf };
 }
 
@@ -246,33 +247,31 @@ void LoadConfig()
 }
 
 // ------------------------------ 日志 ------------------------------
-// SKSE::log::log_directory() 只依赖 SHGetKnownFolderPath + REL::Module::IsVR()，
-// 不需要 SKSE::Init，因此可以在 Load 的最开始就建立日志 —— 这样即便后续任何一步
-// 提前退出（例如地址库缺失），也一定会留下可排查的记录。
-// 若拿不到 Documents 目录，回退写到插件 DLL 所在目录（MO2 下即 mod 目录）。
-bool SetupLog()
+// 统一写在 SKSE 插件的规范位置：<文档>\My Games\<游戏>\SKSE\SummonNameFix.log
+// （与 skse64.log 同目录，即 SKSE::log::log_directory()）。
+// 这里刻意放在 Load 的最开头：SKSE::log::log_directory() 只依赖 SHGetKnownFolderPath
+// 与 REL::Module::IsVR()，不依赖 SKSE::Init，所以即使后续任何一步提前退出
+// （例如 Address Library 缺失），也一定留下可排查的记录。
+void SetupLog()
 {
-	const auto dir = []() -> std::filesystem::path {
-		if (auto logsFolder = SKSE::log::log_directory()) {
-			return *logsFolder;
-		}
-		return GetPluginPath().parent_path();
-	}();
+	const auto logsFolder = SKSE::log::log_directory();
+	if (!logsFolder) {
+		return;   // 拿不到规范目录就不写日志，避免"东一个西一个"
+	}
 
 	std::error_code ec;
-	std::filesystem::create_directories(dir, ec);
+	std::filesystem::create_directories(*logsFolder, ec);
 
 	try {
-		const auto logFilePath = dir / "SummonNameFix.log";
+		const auto logFilePath = *logsFolder / "SummonNameFix.log";
 		auto fileLogger = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
 		auto logger = std::make_shared<spdlog::logger>("global", std::move(fileLogger));
 		logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
 		logger->set_level(spdlog::level::info);
 		logger->flush_on(spdlog::level::info);
 		spdlog::set_default_logger(std::move(logger));
-		return true;
 	} catch (const std::exception&) {
-		return false;
+		// 日志不可写时静默继续：插件功能本身不依赖日志
 	}
 }
 
