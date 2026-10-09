@@ -74,7 +74,7 @@ jobs:
           }
           if (-not $dll) { Write-Error "构建产物 SummonNameFix.dll 未找到"; exit 1 }
           Copy-Item $dll.FullName dist/
-          Copy-Item data/SummonNameFix.ini dist/
+          Copy-Item data/SummonNameFixCN.ini dist/SummonNameFix.ini
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
