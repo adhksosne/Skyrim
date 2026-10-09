@@ -16,7 +16,8 @@
 // 兼容性说明：
 //   - 不依赖任何已发布的 Address Library ID（24212 / 17486 仅在旧版 REPORT 中作为记录）；
 //     全部通过运行时特征扫描动态定位，理论上覆盖所有包含相同格式串的运行时（SE 1.x / AE 1.6.x / VR 1.4.x）。
-//   - 核心补丁不依赖 Address Library（纯 Win32 内存扫描）；只有可选兜底 hook 需要它。
+//   - 核心补丁（格式串扫描 + 等长替换）为纯 Win32 实现，不依赖 Address Library；
+//     仅可选的 GetDisplayFullName 兜底 hook 需要地址库（缺失时记录日志并跳过）。
 //   - 任何一步（找不到原串、lea 偏移不符、原串校验失败、VirtualProtect 失败）都会记录日志并跳过该补丁，
 //     保证不会因版本漂移误写任意字节。
 
@@ -171,13 +172,12 @@ void ResolveLanguage()
 std::filesystem::path GetPluginPath()
 {
 	HMODULE self = nullptr;
-	::GetModuleHandleExW(
+	::GetModuleHandleExA(
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		reinterpret_cast<LPCWSTR>(&GetPluginPath),
+		reinterpret_cast<LPCSTR>(&GetPluginPath),
 		&self);
-	// 用宽字符 API，避免 Mod Organizer 等带非 ASCII 的路径出问题
-	wchar_t buf[MAX_PATH]{};
-	::GetModuleFileNameW(self, buf, static_cast<DWORD>(std::size(buf)));
+	char buf[MAX_PATH]{};
+	::GetModuleFileNameA(self, buf, static_cast<DWORD>(std::size(buf)));
 	return { buf };
 }
 
@@ -246,21 +246,33 @@ void LoadConfig()
 }
 
 // ------------------------------ 日志 ------------------------------
-// 日志写在 DLL 同目录（<插件目录>\SummonNameFix.log）。
-// 刻意不依赖 SKSE / Address Library，这样即使地址库缺失、SKSE::Init 未执行，
-// 也一定会留下可诊断的记录。
-void SetupLog()
+// SKSE::log::log_directory() 只依赖 SHGetKnownFolderPath + REL::Module::IsVR()，
+// 不需要 SKSE::Init，因此可以在 Load 的最开始就建立日志 —— 这样即便后续任何一步
+// 提前退出（例如地址库缺失），也一定会留下可排查的记录。
+// 若拿不到 Documents 目录，回退写到插件 DLL 所在目录（MO2 下即 mod 目录）。
+bool SetupLog()
 {
-	auto logFilePath = GetPluginPath();
-	logFilePath.replace_extension(".log");
+	const auto dir = []() -> std::filesystem::path {
+		if (auto logsFolder = SKSE::log::log_directory()) {
+			return *logsFolder;
+		}
+		return GetPluginPath().parent_path();
+	}();
+
+	std::error_code ec;
+	std::filesystem::create_directories(dir, ec);
+
 	try {
+		const auto logFilePath = dir / "SummonNameFix.log";
 		auto fileLogger = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
 		auto logger = std::make_shared<spdlog::logger>("global", std::move(fileLogger));
-		logger->set_level(spdlog::level::trace);
-		logger->flush_on(spdlog::level::trace);
+		logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+		logger->set_level(spdlog::level::info);
+		logger->flush_on(spdlog::level::info);
 		spdlog::set_default_logger(std::move(logger));
-	} catch (...) {
-		// 无法创建日志文件不致命：退化为默认 logger
+		return true;
+	} catch (const std::exception&) {
+		return false;
 	}
 }
 
@@ -608,8 +620,7 @@ bool InstallHook()
 // ----------------------------------------------------------------------------------
 // SKSE 入口：与 Zzyxz 模板保持一致——AE 读取 SKSEPlugin_Version，SE / VR 走 SKSEPlugin_Query。
 // 不锁死具体版本号；格式串差异由运行时特征扫描 + 双重校验消化，任何一步失败只记日志并跳过。
-// 核心补丁（格式串等长替换）为纯 Win32 内存扫描，不需要 Address Library；
-// 仅可选的 GetDisplayFullName 兜底 hook 需要地址库，缺失时自动跳过。
+// 运行期需要 Address Library（SKSEPlugin_Load 在 Init 前检查，缺失则插件不生效）。
 // ----------------------------------------------------------------------------------
 namespace
 {
@@ -654,24 +665,35 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Query(const SKSE::Query
 
 extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
 {
-	const auto runtime = a_skse->RuntimeVersion();
-
-	// 先建日志、再读配置——这两步都不依赖 SKSE / Address Library。
+	// 第一件事就是建立日志：这样即使后面任何一步提前退出，也一定留下可排查的记录。
 	g_cfg.logLevel = spdlog::level::info;
 	SetupLog();
+
+	const auto runtime = a_skse->RuntimeVersion();
+	const bool hasAddressLibrary = !REL::Module::FindAddressLibrary().empty();
+	spdlog::info("SummonNameFix v{} 开始加载：运行时 {}，Address Library {}。",
+		kPluginVersion.string("."), runtime.string(),
+		hasAddressLibrary ? "已找到" : "缺失");
+
+	if (hasAddressLibrary) {
+		// 只有地址库就绪时才 Init —— 缺地址库时 Init 会直接终止游戏。
+		SKSE::Init(a_skse);
+	}
+
 	LoadConfig();
 	ResolveLanguage();
 	spdlog::set_level(g_cfg.logLevel);
-
-	spdlog::info("SummonNameFix v{} 启动（运行时 {}，语言包：{}）。",
-		kPluginVersion.string("."), runtime.string(), g_cfg.language);
 
 	if (!g_cfg.master) {
 		spdlog::warn("ini 配置 Enable=false，插件不做任何修改，直接退出。");
 		return true;
 	}
 
+	spdlog::info("语言包：{}（格式串 \"{}\" → \"{}\"）。",
+		g_cfg.language, patch_bytes::kFmtExpected, g_lang.fmtReplacement);
+
 	// 补丁 1：召唤物/有主 Actor 路径（格式串 "%s's %s" → 目标语言等长替换）
+	// 核心补丁是纯 Win32 内存扫描 + 等长替换，不依赖 Address Library。
 	if (g_cfg.patchSummon) {
 		ApplyStringPatch(
 			patch_bytes::kFmtExpected,
@@ -689,15 +711,12 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 			g_lang.aposName);
 	}
 
-	// 兜底 hook 需要通过 REL::ID 解析函数地址，因此需要 Address Library。
-	// 注意：地址库缺失时绝不能调用 SKSE::Init —— 那会直接终止游戏。
-	// 上面的核心格式串补丁是纯 Win32 内存扫描，不依赖地址库，已完成。
-	if (REL::Module::FindAddressLibrary().empty()) {
-		spdlog::warn("未找到 Address Library，跳过兜底 hook（核心格式串补丁已完成，不受影响）。");
-	} else {
-		SKSE::Init(a_skse);
-		if (g_cfg.hookDisplayName || g_cfg.logNameCalls) {
+	// 兜底 hook：GetDisplayFullName（ID 19354/19781）走 REL::Relocation，必须有地址库。
+	if (g_cfg.hookDisplayName || g_cfg.logNameCalls) {
+		if (hasAddressLibrary) {
 			InstallHook();
+		} else {
+			spdlog::warn("Address Library 缺失，跳过 GetDisplayFullName 兜底 hook。");
 		}
 	}
 
