@@ -12,10 +12,11 @@ jobs:
     env:
       # 只构建 release 变体，跳过用不到的 debug，时间约减半
       VCPKG_BUILD_TYPE: release
-      # 与 CMake 的 -DVCPKG_TARGET_TRIPLET 保持一致，避免 run-vcpkg 装错 triplet 再装一遍
-      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+      VCPKG_TRIPLET: x64-windows-static-md
+      VCPKG_ROOT_DIR: ${{ github.workspace }}/vcpkg
+      VCPKG_INSTALL_DIR: ${{ github.workspace }}/build/vcpkg_installed
       # vcpkg 二进制缓存目录（由 actions/cache 持久化，命中后依赖秒装）
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_bincache
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,31 +36,39 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      # 必须先跑 MSVC 再跑 vcpkg：vcvarsall 会把 VCPKG_ROOT 改写成 VS 自带的 vcpkg，
-      # 而 VS 自带那份默认关闭 manifest 自动安装，会导致依赖没装、find_package 直接失败。
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          # 固定检出目录，便于下面用显式路径引用，彻底不依赖会被改写的 VCPKG_ROOT
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
           vcpkgGitCommitId: fc3f61366102c1f0d4547c06d03c523bb18c13a7
+          # 只负责把指定版本的 vcpkg 检出并引导好，依赖安装由下面显式步骤完成
+          runVcpkgInstall: false
+
+      # 显式安装依赖：run-vcpkg 的隐式安装在新 runner 上不可靠（既可能装错 triplet，
+      # 又会关掉 CMake 的自动 manifest 安装），所以这里自己装到 CMake 会查找的目录。
+      - name: Install dependencies (vcpkg manifest)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT_DIR/vcpkg.exe" install `
+            --triplet $env:VCPKG_TRIPLET `
+            --x-manifest-root="${{ github.workspace }}" `
+            --x-install-root="$env:VCPKG_INSTALL_DIR"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error title=vcpkg install failed::exit code $LASTEXITCODE"
+            exit 1
+          }
 
       - name: Configure (Release, Ninja, vcpkg manifest)
         shell: pwsh
-        env:
-          # run-vcpkg 会在 job 级写入 VCPKG_BINARY_SOURCES=clear;x-gha,readwrite，
-          # 但新版 runner 不再注入 ACTIONS_RUNTIME_TOKEN，x-gha 源会直接报错；
-          # 单独写 clear 又会把默认 files 缓存源清掉，导致依赖从不落盘、每次全量重编。
-          # 正解：显式指定 files 缓存源指向 workspace 目录，由 actions/cache 持久化。
-          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md *>&1 | Tee-Object -FilePath configure.log
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT_DIR/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
+            -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALL_DIR" *>&1 | Tee-Object -FilePath configure.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             # 把 CMake 报错尾部暴露成 GitHub 注解，便于在无日志权限时定位
@@ -71,8 +80,6 @@ jobs:
           }
 
       - name: Build
-        env:
-          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
         run: cmake --build build
 
       - name: Collect artifacts
