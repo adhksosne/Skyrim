@@ -27,8 +27,12 @@
 #include <charconv>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <iterator>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -63,6 +67,8 @@ namespace patch_bytes
 
 	// 兜底 hook 的 strstr 快速判断针（含尾随空格；拼接处必为 "'s "）
 	constexpr std::string_view kNeedle{ "'s ", 3 };
+	// strstr 需要的是 NUL 结尾串：直接用字面量指针，与 kNeedle 内容一致
+	constexpr const char* kNeedleC = "'s ";
 }
 
 namespace
@@ -274,7 +280,7 @@ namespace
 			return a_name;
 		}
 		// 廉价快速退出：绝大多数调用不含 "'s "，原指针原样返回，零分配。
-		if (!std::strstr(a_name, patch_bytes::kNeedle.data())) {
+		if (!std::strstr(a_name, patch_bytes::kNeedleC)) {
 			return a_name;
 		}
 
@@ -320,7 +326,7 @@ namespace
 				a_this ? a_this->GetFormType() == RE::FormType::ActorCharacter : false,
 				std::strlen(snap),
 				snap,
-				[] {
+				[&snap] {
 					std::string hex;
 					const auto l = std::strlen(snap);
 					hex.reserve(l * 3);
