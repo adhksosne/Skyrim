@@ -55,9 +55,10 @@ jobs:
           & "$env:VCPKG_ROOT_DIR/vcpkg.exe" install `
             --triplet $env:VCPKG_TRIPLET `
             --x-manifest-root="${{ github.workspace }}" `
-            --x-install-root="$env:VCPKG_INSTALL_DIR"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error title=vcpkg install failed::exit code $LASTEXITCODE"
+            --x-install-root="$env:VCPKG_INSTALL_DIR" *>&1 | Tee-Object -FilePath vcpkg-install.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host "::error title=vcpkg install failed::exit code $code"
             exit 1
           }
 
@@ -97,3 +98,18 @@ jobs:
           name: SummonNameFix
           path: dist/
           if-no-files-found: error
+
+      # 失败时把 vcpkg 日志尾部暴露成注解（无需登录也能通过公开 API 读到）
+      - name: Dump vcpkg logs on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($f in @('build/vcpkg-manifest-install.log', 'vcpkg-install.log')) {
+            if (Test-Path $f) {
+              $t = [string](Get-Content $f -Raw)
+              if ($t.Length -gt 2500) { $t = $t.Substring($t.Length - 2500) }
+              Write-Host ("::error title=vcpkg-log $f::" + ($t -replace "`r?`n", "%0A"))
+            } else {
+              Write-Host "::warning title=missing log::$f"
+            }
+          }
