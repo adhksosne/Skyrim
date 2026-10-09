@@ -82,7 +82,9 @@ struct LanguagePack
 };
 
 // 多语言预设（key 即 ini 里的 Language 字段值）
-consteval std::array<std::pair<std::string_view, LanguagePack>, 4> MakePresets()
+// 注意：LanguagePack 内含 std::string，MSVC 无法在常量求值中构造（C2178/C7595），
+// 因此这里用运行期初始化的静态表，而不是 consteval/constexpr。
+std::array<std::pair<std::string_view, LanguagePack>, 4> MakePresets()
 {
 	return {{
 		// 中文
@@ -98,7 +100,7 @@ consteval std::array<std::pair<std::string_view, LanguagePack>, 4> MakePresets()
 
 namespace
 {
-	consteval auto kLanguagePresets = MakePresets();
+	const auto kLanguagePresets = MakePresets();
 }
 
 // ------------------------------ 配置 ------------------------------
@@ -337,7 +339,7 @@ std::uintptr_t ResolveFmtAddrFromCandidate(
 
 	// 向回扫描 lea 指令：实际上此函数已被主循环内联替代，保留以防复用
 	(void)a_leaOpcode;
-	(void a_label);
+	(void)a_label;
 
 	// 向回扫描 lea 指令
 	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
