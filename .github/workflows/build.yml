@@ -9,22 +9,42 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_bincache
     steps:
+      # 子模块里带有超长路径（openvr 的 .dSYM 目录），Windows 上需先开启长路径
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
+      # CommonLibSSE（Zzyxz 修复分支）以子模块形式内置，必须带上 --recursive
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Create vcpkg binary cache dir
+        run: New-Item -ItemType Directory -Force vcpkg_bincache | Out-Null
 
-      - name: Install Ninja
-        run: choco install ninja -y
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-windows-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-bincache-x64-windows-static-
 
-      # 依赖全部由 CMake FetchContent 直接从上游 tag 拉取（见 CMakeLists.txt），
-      # 不再需要 vcpkg / registry / baseline，也不受 runner 镜像里旧端口的影响。
+      # 依赖只有 spdlog / rapidcsv，全部来自 vcpkg 官方仓库（无私有 registry、无陈旧 baseline）。
+      # 直接用 runner 预装的 vcpkg，避免 VS 自带 vcpkg 的行为差异与旧端口兼容问题。
       - name: Configure
         shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release *>&1 | Tee-Object -FilePath configure.log
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = $env:VCPKG_ROOT }
+          Write-Host "vcpkg root: $vcpkgRoot"
+          cmake -S . -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" `
+            -DSKYRIM_VARIANT=UNIVERSAL *>&1 | Tee-Object -FilePath configure.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $raw = Get-Content configure.log -Raw
@@ -37,11 +57,11 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build *>&1 | Tee-Object -FilePath build.log
+          cmake --build build --config Release *>&1 | Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $raw = Get-Content build.log -Raw
-            if ($raw.Length -gt 2000) { $raw = $raw.Substring($raw.Length - 2000) }
+            if ($raw.Length -gt 3000) { $raw = $raw.Substring($raw.Length - 3000) }
             Write-Host ("::error title=CMake build failed::" + ($raw -replace "`r?`n", "%0A"))
             exit 1
           }
@@ -49,7 +69,11 @@ jobs:
       - name: Collect artifacts
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" | Select-Object -First 1
+          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" |
+            Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+          if (-not $dll) {
+            $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" | Select-Object -First 1
+          }
           if (-not $dll) { Write-Error "构建产物 SummonNameFix.dll 未找到"; exit 1 }
           Copy-Item $dll.FullName dist/
           Copy-Item data/SummonNameFixCN.ini dist/SummonNameFix.ini
@@ -57,7 +81,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          # CommonLibSSE-NG 的产物是单个 DLL，同时支持 SE / AE / VR，无需按版本分开构建
+          # 单个 DLL 同时支持 SE / AE / VR，无需按版本分开构建
           name: SummonNameFix
           path: dist/
           if-no-files-found: error

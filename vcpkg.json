@@ -1,0 +1,12 @@
+{
+  "name": "summonnamefix",
+  "version-string": "2.0.0",
+  "description": "SKSE plugin: replaces the hardcoded 's possessive in summon / owned-container names with a locale-aware replacement (Chinese/Japanese/Korean/...).",
+  "homepage": "https://github.com/adhksosne/Skyrim",
+  "license": "MIT",
+  "dependencies": [
+    "rapidcsv",
+    "spdlog"
+  ],
+  "builtin-baseline": "78b61582c9e093fda56a01ebb654be15a0033897"
+}
