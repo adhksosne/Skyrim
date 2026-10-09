@@ -49,7 +49,10 @@
 - 写入前校验 `"'s \0"`。
 
 ### 兜底 hook（可选，ini 开关）
-- trampoline `write_branch<5>` 于 19354（prologue 前 5 字节 `40 53 55 56 57` = 3 条完整 push，无 rip-relative，可安全重定位）。
+- **手写跳板**（**不可用 `SKSE::Trampoline::write_branch<5>`**，原因见 §6）：运行时校验 prologue 前 5 字节
+  `40 53 55 56 57`（4 条完整 push、无 rip-relative）→ 在目标 ±2GB 内自行 `VirtualAlloc` 一小块可执行内存
+  → 抄入原始 5 字节 + `jmp` 回 `addr+5` → 最后改写目标首页为 `jmp Hook`。任一环节失败只记日志并跳过。
+- **默认关闭**：两个字符串补丁已覆盖主要路径，hook 仅作残余路径的可选兜底。
 - 返回值含 `'s ` 时替换为 `的`（strstr 快速退出 + mutex + unordered_map 稳定节点缓存 + 上限）。
 - 覆盖残余路径（如 Quest 运行时写入 ExtraTextDisplayData 的含 `'s ` 名字）。
 - Actor 判定：`GetFormType() == FormType::ActorCharacter`（引擎在 24212 内同法判断，+0x1A==0x3E）。
@@ -89,3 +92,40 @@
 4. 槽 76 的完整调用方（哪些 UI 层调用 `call [vtbl+0x260]`）未逐一枚举；已确认 24212/17486 各自格式串仅 1 处 xref，风险受控。
 5. TrueHUD 等第三方 HUD 的取名路径未验证（其用 CommonLibSSE GetDisplayFullName 的话即 19354，不含 's）。
 6. 30 分钟稳定性、误改检查等测试清单项目需用户实测。
+
+## 6. 运行时崩溃复盘（2026-10-10，CrashLoggerSSE 实证）与修复
+
+首次游戏内运行（提交 938b3c3）在启动约 6 分钟后崩溃：`EXCEPTION_ACCESS_VIOLATION`，
+试图执行 `0x7FF7DBA5B748`（不可读内存），调用栈落在 `SummonNameFixCN.dll+0x2C351`
+（即 `HookedGetDisplayFullName`）——该处第一条指令为 `mov rax,[g_origGetDisplayFullName]; call rax`。
+
+**根因（反汇编 + 算术双重实证）**：`SKSE::Trampoline::write_branch<N>` **不是**
+「hook 并返回可调用的原函数」。其实现（CommonLibSSE-NG 3.5.3 `SKSE/Trampoline.h:292-308`）为：
+
+```
+disp = *(int32*)(a_src + N - 4);   // 取 a_src+1 处的 4 字节
+func = (a_src + N) + disp;         // 当作 rel32 解引用
+... 把 a_src 前 N 字节覆盖为 jmp ...
+return func;
+```
+
+它假设 `a_src` 开头本就是一条 `jmp rel32` 跳转桩（用于改指针/thunk 重定向），
+**完全不重定位原始指令**。而 `GetDisplayFullName` 开头是 `40 53 55 56 57`：
+
+| 项 | 值 |
+|---|---|
+| SkyrimSE.exe 基址（崩溃日志第 673 行） | `0x7FF784260000` |
+| GetDisplayFullName = 基址 + RVA 0x2961F0 | `0x7FF7844F61F0` |
+| 取 a_src+1 的 `53 55 56 57` 当 rel32 | `0x57565553` |
+| 返回值 = `0x7FF7844F61F0 + 5 + 0x57565553` | **`0x7FF7DBA5B748`** |
+| 崩溃日志中的野地址 | **`0x7FF7DBA5B748`**（完全一致） |
+
+**同一次崩溃日志同时反证了两项正面结论**：
+1. 插件日志显示两个字符串补丁**均已成功写入**（`0x7FF785800638` = 基址+0x15A0638、
+   `0x7FF7857B9E84` = 基址+0x1559E84），即地址库 ID→RVA 映射（24212→0x361640、
+   17486→0x22B990）与 lea 偏移均正确；
+2. 崩溃与字符串补丁无关，**仅由 hook 的原函数指针错误引起**。
+
+**修复**：改为手写跳板（§2），并对 prologue 做运行时字节校验；hook 默认关闭。
+上述 0x15A0638 / 0x1559E84 两个格式串地址已在用户真实 exe 上直接核对（内容分别为
+`"%s's %s"` 与 `"'s "`），故 §1 的来源结论由「静态实证」升级为「静态 + 运行时双重实证」。
