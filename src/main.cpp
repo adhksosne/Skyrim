@@ -68,8 +68,8 @@ namespace patch_bytes
 	// 用于反解 lea 的 3 字节 opcode 候选（48 8D xx 是 x64 标准前缀；4C 8D 05 是 lea r8）
 	constexpr std::array<std::uint8_t, 3> kLeaPrefix = { 0x48, 0x8D };
 
-	// 回看 lea 指令的最大字节范围（lea 通常在格式串定义后几个字节内出现）
-	constexpr std::size_t kMaxBackScan = 16;
+	// 回看 lea 指令的最大字节范围（lea 通常紧邻格式串，但不同编译产物/优化级别会有出入）
+	constexpr std::size_t kMaxBackScan = 64;
 }
 
 // 语言包默认值（中文）
@@ -404,51 +404,72 @@ bool ApplyStringPatch(
 		return false;
 	}
 
-	// 过滤：取第一个能被 lea 反解且与原串校验通过的候选
-	std::uintptr_t fmtAddr = 0;
-	for (const auto cand : candidates) {
-		// 尝试从该候选位置附近回扫 lea
-		const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-		const auto scanStart = cand > patch_bytes::kMaxBackScan ? (cand - patch_bytes::kMaxBackScan) : baseAddr;
+	// 第一步：先筛出“内容与原串完全一致（含尾随 NUL）”的候选 —— 这是写入的必要条件。
+	std::vector<std::uintptr_t> exactMatches;
+	std::vector<std::uintptr_t> leaVerified;
+	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
 
+	for (const auto cand : candidates) {
+		const auto* cur = reinterpret_cast<const std::uint8_t*>(cand);
+		if (std::memcmp(cur, a_expected.data(), a_expected.size()) != 0 ||
+			cur[a_expected.size()] != 0) {
+			continue;   // 命中了相同字节序列但不是真正的格式串
+		}
+		exactMatches.push_back(cand);
+
+		// 第二步（加强证据）：在候选之前回扫 lea reg,[rip+disp32]，且反解结果正好指向候选。
+		const auto scanStart = cand > patch_bytes::kMaxBackScan ? (cand - patch_bytes::kMaxBackScan) : baseAddr;
 		for (auto addr = cand - 1; addr >= scanStart; --addr) {
 			const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
-			if (p[0] == 0x48 && p[1] == 0x8D) {
+			// 48 8D + ModRM(mod=00, rm=101 → RIP 相对) 才是 lea reg,[rip+disp32]
+			if (p[0] == 0x48 && p[1] == 0x8D && (p[2] & 0xC7) == 0x05) {
 				const auto disp = *reinterpret_cast<const std::int32_t*>(p + 3);
-				const auto resolved = addr + 7 + static_cast<std::uint32_t>(disp);
+				const auto resolved = static_cast<std::uintptr_t>(
+					static_cast<std::int64_t>(addr) + 7 + static_cast<std::int64_t>(disp));
 				if (resolved == cand) {
-					// 双重校验：lea 指向自己，且内容匹配
-					const auto* cur = reinterpret_cast<const std::uint8_t*>(cand);
-					if (std::memcmp(cur, a_expected.data(), a_expected.size()) == 0 &&
-						cur[a_expected.size()] == 0) {
-						fmtAddr = cand;
-						spdlog::info("[{}] lea 反解成功：lea@0x{:X} → 格式串@0x{:X}", a_label, addr, cand);
-						goto found;
-					}
+					leaVerified.push_back(cand);
+					spdlog::info("[{}] lea 反解成功：lea@0x{:X} → 格式串@0x{:X}", a_label, addr, cand);
+					break;
 				}
 			}
+			if (addr == scanStart) break;   // 防止无符号下溢
 		}
 	}
 
-found:
-	if (fmtAddr == 0) {
-		spdlog::error("[{}] 未能在任何候选位置（共 {} 个）找到同时满足 lea 指向 + 原串校验的地址，放弃。",
-			a_label, candidates.size());
+	// 有 lea 证据就用 lea 证据；没有就退回“原串精确匹配”。
+	// 注意：v1 是直接改已知地址、并没有这一步 lea 校验，所以这里绝不能因为找不到 lea 就整体放弃。
+	const auto& targets = leaVerified.empty() ? exactMatches : leaVerified;
+	if (leaVerified.empty()) {
+		spdlog::warn("[{}] 候选 {} 个，其中 {} 个与原串完全一致，但附近未找到可反解的 lea；按原串精确匹配定位写入。",
+			a_label, candidates.size(), exactMatches.size());
+	}
+	if (targets.empty()) {
+		spdlog::error("[{}] 候选 {} 个，但没有一个的内容与预期原串完全一致，放弃。", a_label, candidates.size());
 		return false;
 	}
 
-	DWORD oldProtect = 0;
-	if (!::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), PAGE_READWRITE, &oldProtect)) {
-		spdlog::error("[{}] VirtualProtect 失败（GetLastError={}），放弃。", a_label, ::GetLastError());
+	std::size_t patched = 0;
+	for (const auto fmtAddr : targets) {
+		DWORD oldProtect = 0;
+		if (!::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), PAGE_READWRITE, &oldProtect)) {
+			spdlog::error("[{}] VirtualProtect 失败（0x{:X}，GetLastError={}），跳过该处。", a_label, fmtAddr, ::GetLastError());
+			continue;
+		}
+		std::memcpy(reinterpret_cast<void*>(fmtAddr), a_replacement.data(), a_replacement.size());
+		DWORD tmp = 0;
+		::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), oldProtect, &tmp);
+		::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(fmtAddr), a_replacement.size());
+
+		spdlog::info("[{}] 已补丁：0x{:X}：\"{}\" -> \"{}\"（等长 {} 字节）。",
+			a_label, fmtAddr, a_expected, std::string(a_replacement), a_replacement.size());
+		++patched;
+	}
+
+	if (patched == 0) {
+		spdlog::error("[{}] 所有候选写入都失败了。", a_label);
 		return false;
 	}
-	std::memcpy(reinterpret_cast<void*>(fmtAddr), a_replacement.data(), a_replacement.size());
-	DWORD tmp = 0;
-	::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), oldProtect, &tmp);
-	::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(fmtAddr), a_replacement.size());
-
-	spdlog::info("[{}] 已补丁：0x{:X}：\"{}\" -> \"{}\"（等长 {} 字节）。",
-		a_label, fmtAddr, a_expected, std::string(a_replacement), a_replacement.size());
+	spdlog::info("[{}] 完成：共补丁 {} 处。", a_label, patched);
 	return true;
 }
 
