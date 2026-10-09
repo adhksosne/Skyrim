@@ -15,7 +15,8 @@
 //
 // 硬性约束：不依赖 ESP/ESL/ESM/Papyrus，不修改存档；版本不匹配时写日志并拒绝加载。
 
-#include "RE/RE.h"
+// 注意：CommonLibSSE-NG 3.5.3 没有 RE/RE.h 聚合头；按实际类型包含具体头
+#include "RE/T/TESObjectREFR.h"
 #include "SKSE/SKSE.h"
 
 #include <Windows.h>
