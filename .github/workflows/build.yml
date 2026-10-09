@@ -12,6 +12,8 @@ jobs:
     env:
       # 只构建 release 变体，跳过用不到的 debug，时间约减半
       VCPKG_BUILD_TYPE: release
+      # 与 CMake 的 -DVCPKG_TARGET_TRIPLET 保持一致，避免 run-vcpkg 装错 triplet 再装一遍
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
       # vcpkg 二进制缓存目录（由 actions/cache 持久化，命中后依赖秒装）
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_bincache
     steps:
@@ -33,14 +35,17 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
+      # 必须先跑 MSVC 再跑 vcpkg：vcvarsall 会把 VCPKG_ROOT 改写成 VS 自带的 vcpkg，
+      # 而 VS 自带那份默认关闭 manifest 自动安装，会导致依赖没装、find_package 直接失败。
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          # 与 vcpkg.json 的 builtin-baseline 保持一致的稳定基线
+          # 固定检出目录，便于下面用显式路径引用，彻底不依赖会被改写的 VCPKG_ROOT
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
           vcpkgGitCommitId: fc3f61366102c1f0d4547c06d03c523bb18c13a7
-
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure (Release, Ninja, vcpkg manifest)
         shell: pwsh
@@ -53,7 +58,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md *>&1 | Tee-Object -FilePath configure.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
