@@ -9,117 +9,42 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      # 只构建 release 变体，跳过用不到的 debug，时间约减半
-      VCPKG_BUILD_TYPE: release
-      VCPKG_TRIPLET: x64-windows-static-md
-      VCPKG_ROOT_DIR: ${{ github.workspace }}/vcpkg
-      VCPKG_INSTALL_DIR: ${{ github.workspace }}/build/vcpkg_installed
-      # vcpkg 二进制缓存目录（由 actions/cache 持久化，命中后依赖秒装）
-      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create vcpkg binary cache dir
-        run: New-Item -ItemType Directory -Force vcpkg_bincache | Out-Null
-
-      - name: Cache vcpkg binaries
-        uses: actions/cache@v4
-        with:
-          path: vcpkg_bincache
-          # key 带 v3 前缀：v2 期间有过一次「CMake 解析失败、vcpkg 根本没跑」的失败提交，
-          # 它会把空缓存写进同名 key，导致后续一直命中空缓存。升版本号强制重建。
-          key: vcpkg-bincache-v3-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-bincache-v3-x64-windows-static-md-
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      # runner 自带的 CMake 已是 4.x，而 vcpkg 基线(2022-11)里的老端口(如 xbyak)仍用
-      # cmake_minimum_required(<3.5)，CMake 4 已移除该兼容，会直接 configure 失败。
-      # 固定 CMake/Ninja 版本，保证旧端口与主工程都能正常配置。
-      - name: Setup CMake and Ninja (pinned)
-        uses: lukka/get-cmake@latest
-        with:
-          cmakeVersion: 3.29.6
-          ninjaVersion: 1.12.1
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: ${{ github.workspace }}/vcpkg
-          vcpkgGitCommitId: fc3f61366102c1f0d4547c06d03c523bb18c13a7
-          # 只负责把指定版本的 vcpkg 检出并引导好，依赖安装由下面显式步骤完成
-          runVcpkgInstall: false
-
-      # 显式安装依赖：run-vcpkg 的隐式安装在新 runner 上不可靠（既可能装错 triplet，
-      # 又会关掉 CMake 的自动 manifest 安装），所以这里自己装到 CMake 会查找的目录。
-      - name: Install dependencies (vcpkg manifest)
+      # 依赖全部由 CMake FetchContent 直接从上游 tag 拉取（见 CMakeLists.txt），
+      # 不再需要 vcpkg / registry / baseline，也不受 runner 镜像里旧端口的影响。
+      - name: Configure
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT_DIR/vcpkg.exe" install `
-            --triplet ${{ env.VCPKG_TRIPLET }} `
-            --x-manifest-root="${{ github.workspace }}" `
-            --x-install-root="$env:VCPKG_INSTALL_DIR" *>&1 | Tee-Object -FilePath vcpkg-install.log
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release *>&1 | Tee-Object -FilePath configure.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
-            Write-Host "::error title=vcpkg install failed::exit code $code"
-            exit 1
-          }
-
-      - name: Diagnose vcpkg layout
-        if: always()
-        shell: pwsh
-        run: |
-          $out = @()
-          $out += "VCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_DIR"
-          foreach ($d in @('build/vcpkg_installed', 'vcpkg_installed', "$env:VCPKG_ROOT_DIR/installed")) {
-            $out += "== $d exists=$(Test-Path $d)"
-            if (Test-Path $d) {
-              $out += "  entries: " + ((Get-ChildItem $d | Select-Object -ExpandProperty Name) -join ',')
-              $out += "  share: " + ((Get-ChildItem "$d/*/share" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')
-            }
-          }
-          $out += "== CommonLibSSE* files under build =="
-          $out += ((Get-ChildItem 'build' -Recurse -Filter 'CommonLibSSE*.cmake' -ErrorAction SilentlyContinue | Select-Object -First 10 -ExpandProperty FullName) -join ' ; ')
-          $out += "== cmake/ninja =="
-          $out += ((cmake --version | Select-Object -First 1) -join '')
-          $out += ((Get-Command ninja -ErrorAction SilentlyContinue).Source)
-          $m = ($out -join ' | ')
-          if ($m.Length -gt 3000) { $m = $m.Substring(0, 3000) }
-          Write-Host ("::warning title=vcpkg-layout::$m")
-
-          $logs = Get-ChildItem "$env:VCPKG_ROOT_DIR/buildtrees" -Recurse -Filter 'config-*-out.log' -ErrorAction SilentlyContinue | Select-Object -First 2
-          foreach ($l in $logs) {
-            $t = [string](Get-Content $l.FullName -Raw -ErrorAction SilentlyContinue)
-            if ($t.Length -gt 2000) { $t = $t.Substring($t.Length - 2000) }
-            Write-Host ("::error title=port-config $($l.Directory.Name)::" + ($t -replace "`r?`n", "%0A"))
-          }
-
-      - name: Configure (Release, Ninja, vcpkg manifest)
-        shell: pwsh
-        run: |
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT_DIR/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} `
-            -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALL_DIR" *>&1 | Tee-Object -FilePath configure.log
-          $code = $LASTEXITCODE
-          if ($code -ne 0) {
-            # 把 CMake 报错尾部暴露成 GitHub 注解，便于在无日志权限时定位
             $raw = Get-Content configure.log -Raw
             if ([string]::IsNullOrEmpty($raw)) { $raw = '(no output)' }
-            if ($raw.Length -gt 900) { $raw = $raw.Substring($raw.Length - 900) }
+            if ($raw.Length -gt 2000) { $raw = $raw.Substring($raw.Length - 2000) }
             Write-Host ("::error title=CMake configure failed::" + ($raw -replace "`r?`n", "%0A"))
             exit 1
           }
 
       - name: Build
-        run: cmake --build build
+        shell: pwsh
+        run: |
+          cmake --build build *>&1 | Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $raw = Get-Content build.log -Raw
+            if ($raw.Length -gt 2000) { $raw = $raw.Substring($raw.Length - 2000) }
+            Write-Host ("::error title=CMake build failed::" + ($raw -replace "`r?`n", "%0A"))
+            exit 1
+          }
 
       - name: Collect artifacts
         run: |
@@ -136,18 +61,3 @@ jobs:
           name: SummonNameFix
           path: dist/
           if-no-files-found: error
-
-      # 失败时把 vcpkg 日志尾部暴露成注解（无需登录也能通过公开 API 读到）
-      - name: Dump vcpkg logs on failure
-        if: failure()
-        shell: pwsh
-        run: |
-          foreach ($f in @('build/vcpkg-manifest-install.log', 'vcpkg-install.log')) {
-            if (Test-Path $f) {
-              $t = [string](Get-Content $f -Raw)
-              if ($t.Length -gt 2500) { $t = $t.Substring($t.Length - 2500) }
-              Write-Host ("::error title=vcpkg-log $f::" + ($t -replace "`r?`n", "%0A"))
-            } else {
-              Write-Host "::warning title=missing log::$f"
-            }
-          }
