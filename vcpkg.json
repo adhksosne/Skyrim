@@ -3,5 +3,8 @@
   "name": "summonnamefix",
   "version-semver": "2.0.0",
   "description": "Cross-version SKSE plugin (SE/AE/VR): replaces hardcoded 's possessive in summon/owned-container names with locale-aware replacement, no ESP/ESM/Papyrus dependency.",
-  "builtin-baseline": "fc3f61366102c1f0d4547c06d03c523bb18c13a7"
+  "builtin-baseline": "fc3f61366102c1f0d4547c06d03c523bb18c13a7",
+  "dependencies": [
+    "commonlibsse-ng"
+  ]
 }
