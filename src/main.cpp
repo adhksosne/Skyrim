@@ -80,7 +80,7 @@ namespace
 		bool master = true;             // Enable：总开关
 		bool patchSummon = true;        // PatchSummonPath："%s's %s" -> "%s的%s"
 		bool patchContainer = true;     // PatchContainerPath："'s " -> "的"
-		bool hookDisplayName = true;    // HookDisplayName：兜底 hook GetDisplayFullName
+		bool hookDisplayName = false;   // HookDisplayName：兜底 hook GetDisplayFullName（默认关闭；字符串补丁已覆盖主要路径）
 		bool hookOnlyActors = true;     // HookOnlyActors：兜底 hook 仅处理 Actor（FormType==ActorCharacter）
 		std::size_t cacheLimit = 4096;  // CacheLimit：兜底缓存上限，超限后走 thread_local 降级
 		spdlog::level::level_enum logLevel = spdlog::level::info;
@@ -349,6 +349,64 @@ namespace
 		return FixName(name);
 	}
 
+	// 手写 5 字节相对跳转（E9 rel32）。任何失败都记录日志并返回 false，绝不中断。
+	bool WriteRel32Jump(std::uintptr_t a_src, std::uintptr_t a_dst)
+	{
+		const auto delta = static_cast<std::ptrdiff_t>(a_dst) - static_cast<std::ptrdiff_t>(a_src + 5);
+		if (delta < std::numeric_limits<std::int32_t>::min() || delta > std::numeric_limits<std::int32_t>::max()) {
+			spdlog::error("相对跳转超范围（0x{:X} -> 0x{:X}），放弃。", a_src, a_dst);
+			return false;
+		}
+
+		std::uint8_t code[5] = { 0xE9 };
+		const auto disp = static_cast<std::int32_t>(delta);
+		std::memcpy(code + 1, &disp, sizeof(disp));
+
+		DWORD oldProtect = 0;
+		if (!::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			spdlog::error("VirtualProtect 失败（0x{:X}，GetLastError={}），放弃。", a_src, ::GetLastError());
+			return false;
+		}
+		std::memcpy(reinterpret_cast<void*>(a_src), code, sizeof(code));
+		DWORD tmp = 0;
+		::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), oldProtect, &tmp);
+		::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(a_src), sizeof(code));
+		return true;
+	}
+
+	// 在目标地址 ±2GB 范围内分配一小块可执行内存（供跳板使用，保证 rel32 可达）。
+	void* AllocateExecNear(std::uintptr_t a_target, std::size_t a_size)
+	{
+		SYSTEM_INFO si{};
+		::GetSystemInfo(&si);
+		const auto gran = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
+		constexpr std::uintptr_t kReach = 0x7FFF0000ull;  // 略小于 2GB，留安全余量
+		const auto low = (a_target > kReach) ? (a_target - kReach) : gran;
+		const auto high = a_target + kReach;
+		const auto start = a_target & ~(gran - 1);
+
+		// 先从目标向下找，再从目标向上找；VirtualAlloc 对不可用区间会快速失败。
+		for (auto addr = start; addr > low; addr -= gran) {
+			if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+				return p;
+			}
+		}
+		for (auto addr = start + gran; addr < high; addr += gran) {
+			if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+				return p;
+			}
+		}
+		return nullptr;
+	}
+
+	// 安装兜底 hook。
+	//
+	// 重要教训（已由崩溃转储 + 反汇编实证）：SKSE::Trampoline::write_branch<N> 不是
+	// 「hook 并返回可调用的原函数」——它假设 a_src 开头是一条 jmp rel32 跳转桩，
+	// 把 a_src+1 处的 4 字节当作 rel32 解引用后返回，且完全不重定位原始指令。
+	// GetDisplayFullName 开头是 40 53 55 56 57（push rbx/rbp/rsi/rdi），于是它把
+	// 53 55 56 57 当成 rel32，返回 0x7FF7DBA5B748 这样的野地址，调用即崩。
+	// 因此这里手写跳板：分配 → 抄原始 5 字节 → 回跳 addr+5 → 改写目标首页。
 	bool InstallHook()
 	{
 		REL::Relocation<std::uintptr_t> func{ RELOCATION_ID(ids::kGetDisplayFullName, ids::kAe_GetDisplayFullName) };
@@ -357,16 +415,38 @@ namespace
 			spdlog::error("GetDisplayFullName 地址解析失败（ID {}），跳过兜底 hook。", ids::kGetDisplayFullName);
 			return false;
 		}
-		// 函数头前 5 字节为 40 53 55 56 57（push rbx/rbp/rsi，3 条完整指令，无 rip-relative），可安全重定位。
-		SKSE::AllocTrampoline(64);
-		auto& trampoline = SKSE::GetTrampoline();
-		g_origGetDisplayFullName = SKSE::stl::unrestricted_cast<decltype(g_origGetDisplayFullName)>(
-			trampoline.write_branch<5>(addr, HookedGetDisplayFullName));
-		if (!g_origGetDisplayFullName) {
-			spdlog::error("兜底 hook 安装失败，跳过。");
+
+		// 运行时校验函数头：防版本漂移、也防 GetDisplayFullName 已被其它插件（如 Lexicon）先行 hook。
+		// 本机 1.5.97 实测为 40 53 55 56 57，4 条完整指令共 5 字节、无 rip-relative，可整体搬移。
+		static constexpr std::array<std::uint8_t, 5> kPrologue{ 0x40, 0x53, 0x55, 0x56, 0x57 };
+		if (std::memcmp(reinterpret_cast<const void*>(addr), kPrologue.data(), kPrologue.size()) != 0) {
+			spdlog::error("GetDisplayFullName（0x{:X}）函数头与预期不符（已被其它插件 hook 或版本漂移），跳过兜底 hook。", addr);
 			return false;
 		}
-		spdlog::info("兜底 hook 已安装于 0x{:X}（GetDisplayFullName，仅 Actor={}）。", addr, g_cfg.hookOnlyActors);
+
+		auto* stub = static_cast<std::uint8_t*>(AllocateExecNear(addr, 32));
+		if (!stub) {
+			spdlog::error("无法在 GetDisplayFullName 附近分配跳板内存，跳过兜底 hook。");
+			return false;
+		}
+		std::memcpy(stub, reinterpret_cast<const void*>(addr), kPrologue.size());
+		if (!WriteRel32Jump(reinterpret_cast<std::uintptr_t>(stub) + kPrologue.size(), addr + kPrologue.size())) {
+			::VirtualFree(stub, 0, MEM_RELEASE);
+			spdlog::error("跳板回跳写入失败，跳过兜底 hook。");
+			return false;
+		}
+
+		// 先设置原函数指针，再改写目标首页，确保不存在「hook 已生效但原函数指针为空」的窗口。
+		g_origGetDisplayFullName = reinterpret_cast<decltype(g_origGetDisplayFullName)>(stub);
+		if (!WriteRel32Jump(addr, reinterpret_cast<std::uintptr_t>(&HookedGetDisplayFullName))) {
+			g_origGetDisplayFullName = nullptr;
+			::VirtualFree(stub, 0, MEM_RELEASE);
+			spdlog::error("GetDisplayFullName 首页改写失败，跳过兜底 hook。");
+			return false;
+		}
+
+		spdlog::info("兜底 hook 已安装：目标 0x{:X}，跳板 0x{:X}（仅 Actor={}）。",
+			addr, reinterpret_cast<std::uintptr_t>(stub), g_cfg.hookOnlyActors);
 		return true;
 	}
 }
@@ -386,7 +466,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	spdlog::set_level(g_cfg.logLevel);
 
 	spdlog::info("SummonNameFixCN v{} 加载中（仅支持 Skyrim SE 1.5.97）。",
-		SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("/"));
+		SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."));
 
 	if (!g_cfg.master) {
 		spdlog::warn("ini 配置 Enable=false，插件不做任何修改，直接退出。");
