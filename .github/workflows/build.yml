@@ -67,6 +67,17 @@ jobs:
             exit 1
           }
 
+      # 缓存恢复出来的 .obj/.lib/.pch 时间戳会早于本次 checkout 的源码，
+      # MSBuild 因此判定“输出过期”并全量重编（这就是缓存命中了却还要 12 分钟的原因）。
+      # 这里把这些产物时间戳刷新到最新，让它正确走增量编译。
+      - name: Refresh cached build outputs timestamps
+        shell: pwsh
+        run: |
+          if (Test-Path build) {
+            Get-ChildItem build -Recurse -File -Include *.obj,*.lib,*.pch,*.res -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.LastWriteTime = Get-Date }
+          }
+
       - name: Build
         shell: pwsh
         env:

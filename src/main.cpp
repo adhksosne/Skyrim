@@ -246,32 +246,69 @@ void LoadConfig()
 	}
 }
 
+// 游戏根目录（exe 所在目录）。用于判断 Steam / GOG / VR，不依赖当前工作目录。
+std::optional<std::filesystem::path> GetGameRoot()
+{
+	const HMODULE exe = ::GetModuleHandleW(nullptr);
+	if (!exe) return std::nullopt;
+	wchar_t buf[MAX_PATH]{};
+	const DWORD len = ::GetModuleFileNameW(exe, buf, static_cast<DWORD>(std::size(buf)));
+	if (len == 0 || len >= std::size(buf)) return std::nullopt;
+	return std::filesystem::path{ buf }.parent_path();
+}
+
+// 规范日志目录：<文档>\My Games\<版本>\SKSE
+// 关键：版本按 exe 所在目录判断，而不是按当前工作目录。
+// CommonLibSSE 自带的 log_directory() 用 CWD 里的 steam_api64.dll 判断版本，
+// 在 MO2（StockGame 布局）等启动方式下 CWD 未必是游戏目录，会被误判成 GOG 版，
+// 结果日志写进了 "Skyrim Special Edition GOG" 文件夹，看起来就像"完全没有日志"。
+std::filesystem::path GetCanonicalLogDir()
+{
+	const auto ngDir = SKSE::log::log_directory();   // 只借用它解析出 <文档>\My Games
+	if (!ngDir) return {};
+
+	const auto myGames = ngDir->parent_path().parent_path();
+
+	std::wstring variant = L"Skyrim Special Edition";
+	if (const auto gameRoot = GetGameRoot()) {
+		std::error_code ec;
+		if (std::filesystem::exists(*gameRoot / L"openvr_api.dll", ec)) {
+			variant = L"Skyrim VR";
+		} else if (!std::filesystem::exists(*gameRoot / L"steam_api64.dll", ec)) {
+			variant = L"Skyrim Special Edition GOG";
+		}
+	}
+	return myGames / variant / L"SKSE";
+}
+
 // ------------------------------ 日志 ------------------------------
-// 统一写在 SKSE 插件的规范位置：<文档>\My Games\<游戏>\SKSE\SummonNameFix.log
-// （与 skse64.log 同目录，即 SKSE::log::log_directory()）。
-// 这里刻意放在 Load 的最开头：SKSE::log::log_directory() 只依赖 SHGetKnownFolderPath
-// 与 REL::Module::IsVR()，不依赖 SKSE::Init，所以即使后续任何一步提前退出
-// （例如 Address Library 缺失），也一定留下可排查的记录。
+// 统一写在 SKSE 插件的规范位置：<文档>\My Games\<版本>\SKSE\SummonNameFix.log
+// （与 skse64.log 同目录）。
+// 这里刻意放在 Load 的最开头：即使后续任何一步提前退出（例如地址库缺失），
+// 也一定留下可排查的记录。
 void SetupLog()
 {
-	const auto logsFolder = SKSE::log::log_directory();
-	if (!logsFolder) {
+	const auto logsFolder = GetCanonicalLogDir();
+	if (logsFolder.empty()) {
 		return;   // 拿不到规范目录就不写日志，避免"东一个西一个"
 	}
 
 	std::error_code ec;
-	std::filesystem::create_directories(*logsFolder, ec);
+	std::filesystem::create_directories(logsFolder, ec);
 
 	try {
-		const auto logFilePath = *logsFolder / "SummonNameFix.log";
+		const auto logFilePath = logsFolder / "SummonNameFix.log";
 		auto fileLogger = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
 		auto logger = std::make_shared<spdlog::logger>("global", std::move(fileLogger));
 		logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
 		logger->set_level(spdlog::level::info);
 		logger->flush_on(spdlog::level::info);
 		spdlog::set_default_logger(std::move(logger));
-	} catch (const std::exception&) {
+		spdlog::info("日志文件：{}（游戏目录：{}）", logFilePath.string(),
+			GetGameRoot() ? GetGameRoot()->string() : std::string("(未知)"));
+	} catch (const std::exception& e) {
 		// 日志不可写时静默继续：插件功能本身不依赖日志
+		(void)e;
 	}
 }
 
