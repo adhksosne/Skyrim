@@ -39,6 +39,15 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
+      # runner 自带的 CMake 已是 4.x，而 vcpkg 基线(2022-11)里的老端口(如 xbyak)仍用
+      # cmake_minimum_required(<3.5)，CMake 4 已移除该兼容，会直接 configure 失败。
+      # 固定 CMake/Ninja 版本，保证旧端口与主工程都能正常配置。
+      - name: Setup CMake and Ninja (pinned)
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: 3.29.6
+          ninjaVersion: 1.12.1
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -77,9 +86,19 @@ jobs:
           }
           $out += "== CommonLibSSE* files under build =="
           $out += ((Get-ChildItem 'build' -Recurse -Filter 'CommonLibSSE*.cmake' -ErrorAction SilentlyContinue | Select-Object -First 10 -ExpandProperty FullName) -join ' ; ')
+          $out += "== cmake/ninja =="
+          $out += ((cmake --version | Select-Object -First 1) -join '')
+          $out += ((Get-Command ninja -ErrorAction SilentlyContinue).Source)
           $m = ($out -join ' | ')
           if ($m.Length -gt 3000) { $m = $m.Substring(0, 3000) }
           Write-Host ("::warning title=vcpkg-layout::$m")
+
+          $logs = Get-ChildItem "$env:VCPKG_ROOT_DIR/buildtrees" -Recurse -Filter 'config-*-out.log' -ErrorAction SilentlyContinue | Select-Object -First 2
+          foreach ($l in $logs) {
+            $t = [string](Get-Content $l.FullName -Raw -ErrorAction SilentlyContinue)
+            if ($t.Length -gt 2000) { $t = $t.Substring($t.Length - 2000) }
+            Write-Host ("::error title=port-config $($l.Directory.Name)::" + ($t -replace "`r?`n", "%0A"))
+          }
 
       - name: Configure (Release, Ninja, vcpkg manifest)
         shell: pwsh
