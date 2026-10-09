@@ -139,7 +139,7 @@ namespace
 	// 极简 ini 读取：仅支持 key=value 与 ;/# 注释，节名忽略；缺文件/缺键用默认值。
 	void LoadConfig()
 	{
-		const auto iniPath = GetPluginPath();
+		auto iniPath = GetPluginPath();
 		iniPath.replace_extension(".ini");
 
 		std::ifstream file(iniPath);
@@ -158,7 +158,7 @@ namespace
 			if (eq == std::string::npos) {
 				continue;
 			}
-			const auto key = line.substr(0, eq);
+			auto key = line.substr(0, eq);
 			auto val = line.substr(eq + 1);
 			const auto keyB = key.find_last_not_of(" \t\r\n");
 			const auto valB = val.find_last_not_of(" \t\r\n");
@@ -331,7 +331,7 @@ namespace
 					std::string hex;
 					const auto l = std::strlen(snap);
 					hex.reserve(l * 3);
-					char tmp[8];
+					char tmp[8]{};
 					for (std::size_t i = 0; i < l; ++i) {
 						std::format_to_n(tmp, sizeof(tmp), "{:02x} ", static_cast<std::uint8_t>(snap[i]));
 						hex += tmp;
@@ -360,7 +360,7 @@ namespace
 		// 函数头前 5 字节为 40 53 55 56 57（push rbx/rbp/rsi，3 条完整指令，无 rip-relative），可安全重定位。
 		SKSE::AllocTrampoline(64);
 		auto& trampoline = SKSE::GetTrampoline();
-		g_origGetDisplayFullName = stl::unrestricted_cast<decltype(g_origGetDisplayFullName)>(
+		g_origGetDisplayFullName = SKSE::stl::unrestricted_cast<decltype(g_origGetDisplayFullName)>(
 			trampoline.write_branch<5>(addr, HookedGetDisplayFullName));
 		if (!g_origGetDisplayFullName) {
 			spdlog::error("兜底 hook 安装失败，跳过。");
