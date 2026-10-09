@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")cmake_minimum_required(VERSION 3.21)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 project(SummonNameFix
         VERSION 2.0.0
         DESCRIPTION "Cross-version SKSE plugin: replaces hardcoded 's possessive in summon/owned-container names for any locale (Chinese/Japanese/Korean/etc.)"
