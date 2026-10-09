@@ -1,5 +1,4 @@
 function(commonlibsse_parse_version VERSION)
-    message("${version_match_count}")
     string(REGEX MATCHALL "^([0-9]+)(\\.([0-9]+)(\\.([0-9]+)(\\.([0-9]+))?)?)?$" version_match "${VERSION}")
     unset(COMMONLIBSSE_VERSION_MAJOR PARENT_SCOPE)
     unset(COMMONLIBSSE_VERSION_MINOR PARENT_SCOPE)
@@ -88,6 +87,8 @@ function(target_commonlibsse_properties TARGET)
             set(commonlibsse_plugin_compatibility "SKSE::VersionIndependence::AddressLibrary")
         endif ()
     else ()
+        # 上游 3.5.x 在此处误写成 list(LENGTH ${ADD_COMMONLIBSSE_PLUGIN_COMPATIBLE_RUNTIMES} ...)，
+        # 多版本时 ${} 会把列表展开成多个参数导致报错；此处已修正为不加 ${}。
         list(LENGTH ADD_COMMONLIBSSE_PLUGIN_COMPATIBLE_RUNTIMES commonlibsse_plugin_compatibility_count)
         if(commonlibsse_plugin_compatibility_count GREATER 16)
             message(FATAL_ERROR "No more than 16 version numbers can be provided for COMPATIBLE_RUNTIMES.")

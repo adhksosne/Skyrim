@@ -9,21 +9,10 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        runtime: [se, ae, vr]
-        include:
-          - runtime: se
-            desc: "SE 1.5.x"
-            tag: "SE"
-          - runtime: ae
-            desc: "AE 1.6.x"
-            tag: "AE"
-          - runtime: vr
-            desc: "VR 1.4.x"
-            tag: "VR"
     env:
+      # 只构建 release 变体，跳过用不到的 debug，时间约减半
       VCPKG_BUILD_TYPE: release
+      # vcpkg 二进制缓存目录（由 actions/cache 持久化，命中后依赖秒装）
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_bincache
     steps:
       - name: Checkout
@@ -36,8 +25,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_bincache
-          key: vcpkg-bincache-v2-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-bincache-v2-x64-windows-static-md-
+          # key 带 v3 前缀：v2 期间有过一次「CMake 解析失败、vcpkg 根本没跑」的失败提交，
+          # 它会把空缓存写进同名 key，导致后续一直命中空缓存。升版本号强制重建。
+          key: vcpkg-bincache-v3-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-bincache-v3-x64-windows-static-md-
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -45,19 +36,34 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
+          # 与 vcpkg.json 的 builtin-baseline 保持一致的稳定基线
           vcpkgGitCommitId: fc3f61366102c1f0d4547c06d03c523bb18c13a7
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure (Release, Ninja, vcpkg manifest)
+        shell: pwsh
         env:
+          # run-vcpkg 会在 job 级写入 VCPKG_BINARY_SOURCES=clear;x-gha,readwrite，
+          # 但新版 runner 不再注入 ACTIONS_RUNTIME_TOKEN，x-gha 源会直接报错；
+          # 单独写 clear 又会把默认 files 缓存源清掉，导致依赖从不落盘、每次全量重编。
+          # 正解：显式指定 files 缓存源指向 workspace 目录，由 actions/cache 持久化。
           VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md *>&1 | Tee-Object -FilePath configure.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            # 把 CMake 报错尾部暴露成 GitHub 注解，便于在无日志权限时定位
+            $raw = Get-Content configure.log -Raw
+            if ([string]::IsNullOrEmpty($raw)) { $raw = '(no output)' }
+            if ($raw.Length -gt 900) { $raw = $raw.Substring($raw.Length - 900) }
+            Write-Host ("::error title=CMake configure failed::" + ($raw -replace "`r?`n", "%0A"))
+            exit 1
+          }
 
       - name: Build
         env:
@@ -67,11 +73,7 @@ jobs:
       - name: Collect artifacts
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" |
-            Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
-          if (-not $dll) {
-            $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" | Select-Object -First 1
-          }
+          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" | Select-Object -First 1
           if (-not $dll) { Write-Error "构建产物 SummonNameFix.dll 未找到"; exit 1 }
           Copy-Item $dll.FullName dist/
           Copy-Item data/SummonNameFixCN.ini dist/SummonNameFix.ini
@@ -79,6 +81,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SummonNameFix-${{ matrix.tag }}
+          # CommonLibSSE-NG 的产物是单个 DLL，同时支持 SE / AE / VR，无需按版本分开构建
+          name: SummonNameFix
           path: dist/
           if-no-files-found: error
