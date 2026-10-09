@@ -62,6 +62,25 @@ jobs:
             exit 1
           }
 
+      - name: Diagnose vcpkg layout
+        if: always()
+        shell: pwsh
+        run: |
+          $out = @()
+          $out += "VCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_DIR"
+          foreach ($d in @('build/vcpkg_installed', 'vcpkg_installed', "$env:VCPKG_ROOT_DIR/installed")) {
+            $out += "== $d exists=$(Test-Path $d)"
+            if (Test-Path $d) {
+              $out += "  entries: " + ((Get-ChildItem $d | Select-Object -ExpandProperty Name) -join ',')
+              $out += "  share: " + ((Get-ChildItem "$d/*/share" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ',')
+            }
+          }
+          $out += "== CommonLibSSE* files under build =="
+          $out += ((Get-ChildItem 'build' -Recurse -Filter 'CommonLibSSE*.cmake' -ErrorAction SilentlyContinue | Select-Object -First 10 -ExpandProperty FullName) -join ' ; ')
+          $m = ($out -join ' | ')
+          if ($m.Length -gt 3000) { $m = $m.Substring(0, 3000) }
+          Write-Host ("::warning title=vcpkg-layout::$m")
+
       - name: Configure (Release, Ninja, vcpkg manifest)
         shell: pwsh
         run: |
