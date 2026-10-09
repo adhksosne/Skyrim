@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          # 与 CommonLibSSE-NG 官方 vcpkg.json 的 builtin-baseline 保持一致的稳定基线
+          vcpkgGitCommitId: fc3f61366102c1f0d4547c06d03c523bb18c13a7
+
+      - name: Configure (Release, Ninja, vcpkg manifest)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Collect artifacts
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFixCN.dll" | Select-Object -First 1
+          if (-not $dll) { Write-Error "构建产物 SummonNameFixCN.dll 未找到"; exit 1 }
+          Copy-Item $dll.FullName dist/
+          Copy-Item data/SummonNameFixCN.ini dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SummonNameFixCN-SE197
+          path: dist/
+          if-no-files-found: error

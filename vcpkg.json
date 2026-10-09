@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "summonnamefixcn",
+  "version-semver": "1.0.0",
+  "description": "SKSE plugin (Skyrim SE 1.5.97): replaces the untranslated English possessive \"'s\" in summon / owned-container display names with the Chinese possessive marker, without ESP/ESM/Papyrus.",
+  "dependencies": [
+    "commonlibsse-ng"
+  ]
+}
