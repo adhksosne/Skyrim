@@ -9,10 +9,21 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        runtime: [se, ae, vr]
+        include:
+          - runtime: se
+            desc: "SE 1.5.x"
+            tag: "SE"
+          - runtime: ae
+            desc: "AE 1.6.x"
+            tag: "AE"
+          - runtime: vr
+            desc: "VR 1.4.x"
+            tag: "VR"
     env:
-      # 只构建 release 变体，跳过用不到的 debug，时间约减半
       VCPKG_BUILD_TYPE: release
-      # vcpkg 二进制缓存目录（由 actions/cache 持久化，命中后依赖秒装）
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_bincache
     steps:
       - name: Checkout
@@ -25,8 +36,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_bincache
-          # key 带 v2 前缀：避开旧版 workflow（VCPKG_BINARY_SOURCES=clear，未写入任何内容）
-          # 可能已用同 key 存下的空缓存，否则会永远命中空缓存、无法重建。
           key: vcpkg-bincache-v2-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: vcpkg-bincache-v2-x64-windows-static-md-
 
@@ -36,7 +45,6 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          # 与 vcpkg.json 的 builtin-baseline 保持一致的稳定基线
           vcpkgGitCommitId: fc3f61366102c1f0d4547c06d03c523bb18c13a7
 
       - name: Setup MSVC
@@ -44,11 +52,6 @@ jobs:
 
       - name: Configure (Release, Ninja, vcpkg manifest)
         env:
-          # 关键：run-vcpkg 会在 job 级写入 VCPKG_BINARY_SOURCES=clear;x-gha,readwrite，
-          # 但新版 runner 不再注入 ACTIONS_RUNTIME_TOKEN，x-gha 源会直接报错；
-          # 而单独写 clear 又会把 vcpkg 默认的 files 缓存源也清掉，导致编译好的依赖
-          # 从不落盘、每次 CI 全量重编（这就是之前每次 20 分钟的根因）。
-          # 正解：显式指定 files 缓存源指向 workspace 目录，由 actions/cache 持久化。
           VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
         run: >
           cmake -S . -B build -G Ninja
@@ -64,18 +67,18 @@ jobs:
       - name: Collect artifacts
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFixCN.dll" |
+          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" |
             Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
           if (-not $dll) {
-            $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFixCN.dll" | Select-Object -First 1
+            $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" | Select-Object -First 1
           }
-          if (-not $dll) { Write-Error "构建产物 SummonNameFixCN.dll 未找到"; exit 1 }
+          if (-not $dll) { Write-Error "构建产物 SummonNameFix.dll 未找到"; exit 1 }
           Copy-Item $dll.FullName dist/
-          Copy-Item data/SummonNameFixCN.ini dist/
+          Copy-Item data/SummonNameFix.ini dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SummonNameFixCN-SE197
+          name: SummonNameFix-${{ matrix.tag }}
           path: dist/
           if-no-files-found: error

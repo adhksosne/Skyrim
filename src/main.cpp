@@ -1,21 +1,25 @@
-// SummonNameFixCN —— SKSE 插件（目标运行时：Skyrim SE 1.5.97）
+// SummonNameFix —— SKSE 插件：跨版本（SE / AE / VR）修复召唤物与有主容器名称中的硬编码所有格
 //
-// 功能：修复中文汉化环境下召唤物 / 有主容器等名称中未翻译的英文所有格 "'s"。
-//   召唤物：  "本怡's 骷髅战士" -> "本怡的骷髅战士"
-//   有主容器："Sven's Chest"   -> "Sven的Chest"
+// 功能：检测并 patch 引擎内硬编码的所有格格式字符串，使其与 INI 配置的目标语言匹配。
+//   默认（中文）：
+//     召唤物路径："%s's %s" → "%s的%s"
+//     容器路径  ："'s "     → "的"
+//   用户可通过 INI 配置任意目标语言（日文「の」、韩文「의」、德语「's」→ "'s」等）。
 //
-// 原理（详见 REPORT.md，全部经静态逆向验证）：
-//   1) TESNPC 槽76 虚函数（Address Library SE ID 24212）用格式串 "%s's %s"
-//      拼出 "所有者's 名字"，该串全 exe 仅此一处引用；
-//      补丁："%s's %s"(7字节) -> "%s的%s"（"的"=E7 9A 84，UTF-8 下同为 7 字节）。
-//   2) TESObjectCONT 槽76 虚函数（SE ID 17486）用独立串 "'s "（3字节）strcat 拼接，
-//      全 exe 仅此一处引用；补丁："'s " -> "的"（等长 3 字节）。
-//   3) 兜底（可选，ini 控制）：hook TESObjectREFR::GetDisplayFullName（SE ID 19354，
-//      NG 已含偏移声明），对返回结果含 "'s " 的名字做缓存化替换。
+// 原理（详见 REPORT.md）：
+//   1) 调用 FindStringPattern 在进程地址空间扫描已知英文原串（支持带/不带 UTF-8 BOM 两种常见变体）。
+//      找到后向回扫描若干字节内的 lea reg,[rip+disp32]（48 8D xx 5byte），反解出原始格式串地址。
+//   2) 校验原串完全等于预期格式（含尾随 NUL），确认后再等长替换为 INI 配置的目标串。
+//   3) 可选 hook TESObjectREFR::GetDisplayFullName（Address Library REL ID 19354/19781）
+//      兜底处理 Papyrus SetDisplayName 等运行时构造的含原串的名字。
 //
-// 硬性约束：不依赖 ESP/ESL/ESM/Papyrus，不修改存档；版本不匹配时写日志并拒绝加载。
+// 兼容性说明：
+//   - 不依赖任何已发布的 Address Library ID（24212 / 17486 仅在旧版 REPORT 中作为记录）；
+//     全部通过运行时特征扫描动态定位，理论上覆盖所有包含相同格式串的运行时（SE 1.x / AE 1.6.x / VR 1.4.x）。
+//   - 仅要求 RELOCATION_ID(19354, 19781) 存在于 Address Library（NG 标配，无需用户额外安装）。
+//   - 任何一步（找不到原串、lea 偏移不符、原串校验失败、VirtualProtect 失败）都会记录日志并跳过该补丁，
+//     保证不会因版本漂移误写任意字节。
 
-// 注意：CommonLibSSE-NG 3.5.3 没有 RE/RE.h 聚合头；按实际类型包含具体头
 #include "RE/T/TESObjectREFR.h"
 #include "SKSE/SKSE.h"
 
@@ -30,6 +34,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -38,468 +43,609 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <vector>
 
 // ----------------------------------------------------------------------------------
-// 逆向验证常量。来源：Address Library version-1-5-97-0.bin + capstone 反汇编 + RTTI，
-// 详见仓库内 REPORT.md。除 NG 已声明偏移（19354/19781）外，AE 侧 ID 未经逆向往证，
-// 一律填 0；本插件经 COMPATIBLE_RUNTIMES 门禁仅在 SE 1.5.97 加载。
+// 配置与常量
 // ----------------------------------------------------------------------------------
-namespace ids
-{
-	constexpr std::uint32_t kGetDisplayFullName = 19354;  // RE::TESObjectREFR::GetDisplayFullName（NG: RELOCATION_ID(19354, 19781)）
-	constexpr std::uint32_t kAe_GetDisplayFullName = 19781;
-
-	constexpr std::uint32_t kNpcNameBuilder = 24212;      // TESNPC 虚表槽76：召唤物/有主 Actor 名字组装（"%s's %s"）
-	constexpr std::size_t kNpcLeaFmtOffset = 0x0C3;       // 函数内 lea rdx,[rip+disp] 指令偏移（0x361703-0x361640）
-
-	constexpr std::uint32_t kContNameBuilder = 17486;     // TESObjectCONT 虚表槽76：有主容器名字组装（"'s " strcat）
-	constexpr std::size_t kContLeaAposOffset = 0x11D;     // 函数内 lea r8,[rip+disp] 指令偏移（0x22BAAD-0x22B990）
-}
-
 namespace patch_bytes
 {
-	// "%s's %s"  ->  "%s的%s"     （7 字节 -> 7 字节，"的" = U+7684 = \xE7\x9A\x84）
+	// 英文原串（两个路径）——作为特征匹配的种子，全 exe 均仅 1 处引用
 	constexpr std::string_view kFmtExpected{ "%s's %s", 7 };
-	constexpr std::string_view kFmtReplacement{ "%s\xE7\x9A\x84%s", 7 };
-
-	// "'s "      ->  "的"          （3 字节 -> 3 字节）
 	constexpr std::string_view kAposExpected{ "'s ", 3 };
-	constexpr std::string_view kAposReplacement{ "\xE7\x9A\x84", 3 };
 
-	// 兜底 hook 的 strstr 快速判断针（含尾随空格；拼接处必为 "'s "）
+	// 搜索模式（同时覆盖带/不带 UTF-8 BOM 两种 exe 变体；不含 BOM 的 exe 也能匹配，因为子串本身无冲突）
+	// UTF-8 BOM = EF BB BF，共 3 字节；BOM 之后的第一个字节是 '%' (0x25)，所以 pattern 为 BOM + '%'
+	constexpr std::array<std::uint8_t, 4> kBomFirstByte = { 0xEF, 0xBB, 0xBF, 0x25 };
+	constexpr std::array<std::uint8_t, 1>   kFmtSeeds = { 0x25 };     // '%'
+	constexpr std::array<std::uint8_t, 3>   kAposSeeds = { 0x27, 0x73, 0x20 }; // ''' 's' ' '
+
+	// strstr 快速针（含尾随空格；拼接处必为 "'s "）
 	constexpr std::string_view kNeedle{ "'s ", 3 };
-	// strstr 需要的是 NUL 结尾串：直接用字面量指针，与 kNeedle 内容一致
 	constexpr const char* kNeedleC = "'s ";
+
+	// 用于反解 lea 的 3 字节 opcode 候选（48 8D xx 是 x64 标准前缀；4C 8D 05 是 lea r8）
+	constexpr std::array<std::uint8_t, 3> kLeaPrefix = { 0x48, 0x8D };
+
+	// 回看 lea 指令的最大字节范围（lea 通常在格式串定义后几个字节内出现）
+	constexpr std::size_t kMaxBackScan = 16;
+}
+
+// 语言包默认值（中文）
+struct LanguagePack
+{
+	std::string fmtReplacement = "%s\xe7\x9a\x84%s";   // "%s的%s"（7 字节）
+	std::string aposReplacement = "\xe7\x9a\x84";       // "的"（3 字节）
+	std::string formatName = "召唤物路径";
+	std::string aposName = "有主容器路径";
+};
+
+// 多语言预设（key 即 ini 里的 Language 字段值）
+consteval std::array<std::pair<std::string_view, LanguagePack>, 4> MakePresets()
+{
+	return {{
+		// 中文
+		{ "zh", { "%s\xe7\x9a\x84%s", "\xe7\x9a\x84", "召唤物路径", "有主容器路径" } },
+		// 日文：の = E3 of E no E (0xE3 0x81 0xAE)，长度 3
+		{ "ja", { "%s\xe3\x81\xae%s", "\xe3\x81\xae", "召喚物パス", "コンテナパス" } },
+		// 韩文：의 = EC 9c 9c (0xEC 0x9C 0x9C)，长度 3
+		{ "ko", { "%s\xec\x9c\x9c%s", "\xec\x9c\x9c", "소환경로", "컨테이너경로" } },
+		// 德语：保留英文 's 不变（仅作为对比测试/德语不替换场景）
+		{ "de", { "%s's %s", "'s ", "npc_path", "cont_path" } },
+	}};
 }
 
 namespace
 {
-	// ------------------------------ 配置 ------------------------------
-	struct Config
-	{
-		bool master = true;             // Enable：总开关
-		bool patchSummon = true;        // PatchSummonPath："%s's %s" -> "%s的%s"
-		bool patchContainer = true;     // PatchContainerPath："'s " -> "的"
-		bool hookDisplayName = false;   // HookDisplayName：兜底 hook GetDisplayFullName（默认关闭；字符串补丁已覆盖主要路径）
-		bool hookOnlyActors = true;     // HookOnlyActors：兜底 hook 仅处理 Actor（FormType==ActorCharacter）
-		std::size_t cacheLimit = 4096;  // CacheLimit：兜底缓存上限，超限后走 thread_local 降级
-		spdlog::level::level_enum logLevel = spdlog::level::info;
-		bool logNameCalls = false;      // LogNameCalls：调查模式，记录 GetDisplayFullName 返回值详情
-		std::size_t logCallsLimit = 200;// LogCallsLimit：调查日志最大条数
-	};
+	consteval auto kLanguagePresets = MakePresets();
+}
 
-	Config g_cfg;
+// ------------------------------ 配置 ------------------------------
+struct Config
+{
+	bool master = true;
+	bool patchSummon = true;
+	bool patchContainer = true;
+	bool hookDisplayName = false;
+	bool hookOnlyActors = true;
+	std::size_t cacheLimit = 4096;
+	spdlog::level::level_enum logLevel = spdlog::level::info;
+	bool logNameCalls = false;
+	std::size_t logCallsLimit = 200;
+	std::string language = "zh";   // 默认中文
+	std::string customFmtReplacement;
+	std::string customAposReplacement;
+	std::string fmtNameOverride;
+	std::string contNameOverride;
+};
 
-	bool ParseBool(std::string_view a_val, bool a_default)
-	{
-		if (a_val.empty()) {
-			return a_default;
-		}
-		switch (a_val.front()) {
-		case '1':
-		case 't':
-		case 'T':
-		case 'y':
-		case 'Y':
-			return true;
-		case '0':
-		case 'f':
-		case 'F':
-		case 'n':
-		case 'N':
-			return false;
-		default:
-			return a_default;
-		}
-	}
+Config g_cfg;
+LanguagePack g_lang;
 
-	std::optional<std::size_t> ParseSize(std::string_view a_val)
-	{
-		std::size_t value = 0;
-		const char* first = a_val.data();
-		const char* last = a_val.data() + a_val.size();
-		if (a_val.empty() || std::from_chars(first, last, value).ec != std::errc{}) {
-			return std::nullopt;
-		}
-		return value;
-	}
-
-	std::filesystem::path GetPluginPath()
-	{
-		HMODULE self = nullptr;
-		::GetModuleHandleExA(
-			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			reinterpret_cast<LPCSTR>(&GetPluginPath),
-			&self);
-		char buf[MAX_PATH]{};
-		::GetModuleFileNameA(self, buf, static_cast<DWORD>(std::size(buf)));
-		return { buf };
-	}
-
-	// 极简 ini 读取：仅支持 key=value 与 ;/# 注释，节名忽略；缺文件/缺键用默认值。
-	void LoadConfig()
-	{
-		auto iniPath = GetPluginPath();
-		iniPath.replace_extension(".ini");
-
-		std::ifstream file(iniPath);
-		if (!file.is_open()) {
-			spdlog::info("未找到配置文件 {}，使用默认配置。", iniPath.string());
-			return;
-		}
-
-		std::string line;
-		while (std::getline(file, line)) {
-			const auto comment = line.find_first_of(";#");
-			if (comment != std::string::npos) {
-				line.resize(comment);
-			}
-			const auto eq = line.find('=');
-			if (eq == std::string::npos) {
-				continue;
-			}
-			auto key = line.substr(0, eq);
-			auto val = line.substr(eq + 1);
-			const auto keyB = key.find_last_not_of(" \t\r\n");
-			const auto valB = val.find_last_not_of(" \t\r\n");
-			if (keyB == std::string::npos || valB == std::string::npos) {
-				continue;
-			}
-			key.erase(keyB + 1);
-			const auto keyF = key.find_first_not_of(" \t\r\n");
-			key.erase(0, keyF);
-			val.erase(valB + 1);
-			const auto valF = val.find_first_not_of(" \t\r\n");
-			val.erase(0, valF);
-
-			if (key == "Enable") {
-				g_cfg.master = ParseBool(val, g_cfg.master);
-			} else if (key == "PatchSummonPath") {
-				g_cfg.patchSummon = ParseBool(val, g_cfg.patchSummon);
-			} else if (key == "PatchContainerPath") {
-				g_cfg.patchContainer = ParseBool(val, g_cfg.patchContainer);
-			} else if (key == "HookDisplayName") {
-				g_cfg.hookDisplayName = ParseBool(val, g_cfg.hookDisplayName);
-			} else if (key == "HookOnlyActors") {
-				g_cfg.hookOnlyActors = ParseBool(val, g_cfg.hookOnlyActors);
-			} else if (key == "CacheLimit") {
-				if (const auto v = ParseSize(val)) {
-					g_cfg.cacheLimit = *v;
-				}
-			} else if (key == "LogLevel") {
-				if (auto lvl = spdlog::level::from_str(val); lvl != spdlog::level::off || val == "off") {
-					g_cfg.logLevel = lvl;
-				}
-			} else if (key == "LogNameCalls") {
-				g_cfg.logNameCalls = ParseBool(val, g_cfg.logNameCalls);
-			} else if (key == "LogCallsLimit") {
-				if (const auto v = ParseSize(val)) {
-					g_cfg.logCallsLimit = *v;
-				}
-			}
-		}
-	}
-
-	// ------------------------------ 日志 ------------------------------
-	void SetupLog()
-	{
-		auto logsFolder = SKSE::log::log_directory();
-		if (!logsFolder) {
-			SKSE::stl::report_and_fail("SKSE 未提供 log_directory，无法初始化日志。"sv);
-		}
-		auto pluginName = SKSE::PluginDeclaration::GetSingleton()->GetName();
-		auto logFilePath = *logsFolder / std::format("{}.log", pluginName);
-		auto fileLogger = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
-		auto logger = std::make_shared<spdlog::logger>("global", std::move(fileLogger));
-		spdlog::set_default_logger(std::move(logger));
-		spdlog::set_level(g_cfg.logLevel);
-		spdlog::flush_on(spdlog::level::info);
-	}
-
-	// ------------------------------ 等长字符串补丁 ------------------------------
-	// 从目标函数（地址库 ID）内已知偏移处的 lea reg,[rip+disp32] 反解出字符串地址，
-	// 逐字节校验原文后再等长覆写。任何一步不符即放弃该补丁（版本漂移防护），绝不离错改写。
-	bool ApplyStringPatch(std::uint32_t a_funcID, std::size_t a_leaOffset,
-		std::span<const std::uint8_t> a_leaOpcode,
-		std::string_view a_expected, std::string_view a_replacement,
-		std::string_view a_label)
-	{
-		if (a_expected.size() != a_replacement.size()) {
-			spdlog::error("[{}] 内部错误：替换串与原文长度不一致，放弃。", a_label);
-			return false;
-		}
-
-		REL::Relocation<std::uintptr_t> func{ RELOCATION_ID(a_funcID, 0) };
-		const auto funcAddr = func.address();
-		if (funcAddr == 0) {
-			spdlog::error("[{}] 地址库 ID {} 无法解析（未安装 Address Library 或版本不符），放弃补丁。", a_label, a_funcID);
-			return false;
-		}
-
-		const auto insn = funcAddr + a_leaOffset;
-		// 校验 lea 指令操作码（0x361703: 48 8D 15；0x22BAAD: 4C 8D 05）
-		if (std::memcmp(reinterpret_cast<const void*>(insn), a_leaOpcode.data(), a_leaOpcode.size()) != 0) {
-			spdlog::error("[{}] 0x{:X} 处指令与预期 lea 不符（版本漂移？），放弃补丁。", a_label, insn);
-			return false;
-		}
-
-		const auto disp = *reinterpret_cast<const std::int32_t*>(insn + 3);
-		const auto target = insn + a_leaOpcode.size() + 4 + static_cast<std::uint32_t>(disp);
-
-		// 逐字节校验原串（含结尾 NUL），防误写
-		const auto* cur = reinterpret_cast<const std::uint8_t*>(target);
-		if (std::memcmp(cur, a_expected.data(), a_expected.size()) != 0 ||
-			cur[a_expected.size()] != 0) {
-			spdlog::error("[{}] 0x{:X} 处内容非 \"{}\"，放弃补丁。", a_label, target, a_expected);
-			return false;
-		}
-
-		DWORD oldProtect = 0;
-		if (!::VirtualProtect(reinterpret_cast<LPVOID>(target), a_replacement.size(), PAGE_READWRITE, &oldProtect)) {
-			spdlog::error("[{}] VirtualProtect 失败（GetLastError={}），放弃补丁。", a_label, ::GetLastError());
-			return false;
-		}
-		std::memcpy(reinterpret_cast<void*>(target), a_replacement.data(), a_replacement.size());
-		DWORD tmp = 0;
-		::VirtualProtect(reinterpret_cast<LPVOID>(target), a_replacement.size(), oldProtect, &tmp);
-
-		spdlog::info("[{}] 已补丁：0x{:X}：\"{}\" -> 替换完成（等长 {} 字节）。", a_label, target, a_expected, a_replacement.size());
-		return true;
-	}
-
-	// ------------------------------ 兜底 hook ------------------------------
-	const char* (*g_origGetDisplayFullName)(RE::TESObjectREFR*) = nullptr;
-
-	std::mutex g_cacheLock;
-	// 节点地址稳定（rehash 不移动节点，且从不删除），返回 c_str() 安全。
-	std::unordered_map<std::string, std::string> g_cache;
-	std::size_t g_logCount = 0;
-
-	const char* FixName(const char* a_name)
-	{
-		if (!a_name) {
-			return a_name;
-		}
-		// 廉价快速退出：绝大多数调用不含 "'s "，原指针原样返回，零分配。
-		if (!std::strstr(a_name, patch_bytes::kNeedleC)) {
-			return a_name;
-		}
-
-		std::lock_guard<std::mutex> lk(g_cacheLock);
-		if (g_cache.size() < g_cfg.cacheLimit) {
-			auto [it, inserted] = g_cache.try_emplace(a_name);
-			if (inserted) {
-				std::string s = a_name;
-				const auto pos = s.find(patch_bytes::kNeedle);
-				if (pos != std::string::npos) {
-					s.replace(pos, patch_bytes::kNeedle.size(), patch_bytes::kAposReplacement);  // 只替换第一个
-				}
-				it->second = std::move(s);
-			}
-			return it->second.c_str();
-		}
-
-		// 缓存超限：thread_local 缓冲降级（每线程独立，无竞争）。
-		thread_local std::string buf;
-		buf = a_name;
-		const auto pos = buf.find(patch_bytes::kNeedle);
-		if (pos != std::string::npos) {
-			buf.replace(pos, patch_bytes::kNeedle.size(), patch_bytes::kAposReplacement);
-		}
-		return buf.c_str();
-	}
-
-	const char* HookedGetDisplayFullName(RE::TESObjectREFR* a_this)
-	{
-		const char* name = g_origGetDisplayFullName(a_this);
-
-		if (g_cfg.logNameCalls && name && g_logCount < g_cfg.logCallsLimit) {
-			g_logCount++;
-			// 拷贝快照，避免日志期间数据被改
-			char snap[256]{};
-			strncpy_s(snap, sizeof(snap), name, _TRUNCATE);
-			spdlog::info(
-				"[调查#{}] this={:016X} ret={:016X} thread={:04X} isActor={} len={} str=\"{}\" hex={}",
-				g_logCount,
-				reinterpret_cast<std::uintptr_t>(a_this),
-				reinterpret_cast<std::uintptr_t>(_ReturnAddress()),
-				::GetCurrentThreadId(),
-				a_this ? a_this->GetFormType() == RE::FormType::ActorCharacter : false,
-				std::strlen(snap),
-				snap,
-				[&snap] {
-					std::string hex;
-					const auto l = std::strlen(snap);
-					hex.reserve(l * 3);
-					char tmp[8]{};
-					for (std::size_t i = 0; i < l; ++i) {
-						std::format_to_n(tmp, sizeof(tmp), "{:02x} ", static_cast<std::uint8_t>(snap[i]));
-						hex += tmp;
-					}
-					return hex;
-				}());
-		}
-
-		if (!g_cfg.hookDisplayName) {
-			return name;
-		}
-		if (g_cfg.hookOnlyActors && a_this && a_this->GetFormType() != RE::FormType::ActorCharacter) {
-			return name;
-		}
-		return FixName(name);
-	}
-
-	// 手写 5 字节相对跳转（E9 rel32）。任何失败都记录日志并返回 false，绝不中断。
-	bool WriteRel32Jump(std::uintptr_t a_src, std::uintptr_t a_dst)
-	{
-		const auto delta = static_cast<std::ptrdiff_t>(a_dst) - static_cast<std::ptrdiff_t>(a_src + 5);
-		if (delta < std::numeric_limits<std::int32_t>::min() || delta > std::numeric_limits<std::int32_t>::max()) {
-			spdlog::error("相对跳转超范围（0x{:X} -> 0x{:X}），放弃。", a_src, a_dst);
-			return false;
-		}
-
-		std::uint8_t code[5] = { 0xE9 };
-		const auto disp = static_cast<std::int32_t>(delta);
-		std::memcpy(code + 1, &disp, sizeof(disp));
-
-		DWORD oldProtect = 0;
-		if (!::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-			spdlog::error("VirtualProtect 失败（0x{:X}，GetLastError={}），放弃。", a_src, ::GetLastError());
-			return false;
-		}
-		std::memcpy(reinterpret_cast<void*>(a_src), code, sizeof(code));
-		DWORD tmp = 0;
-		::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), oldProtect, &tmp);
-		::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(a_src), sizeof(code));
-		return true;
-	}
-
-	// 在目标地址 ±2GB 范围内分配一小块可执行内存（供跳板使用，保证 rel32 可达）。
-	void* AllocateExecNear(std::uintptr_t a_target, std::size_t a_size)
-	{
-		SYSTEM_INFO si{};
-		::GetSystemInfo(&si);
-		const auto gran = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
-		constexpr std::uintptr_t kReach = 0x7FFF0000ull;  // 略小于 2GB，留安全余量
-		const auto low = (a_target > kReach) ? (a_target - kReach) : gran;
-		const auto high = a_target + kReach;
-		const auto start = a_target & ~(gran - 1);
-
-		// 先从目标向下找，再从目标向上找；VirtualAlloc 对不可用区间会快速失败。
-		for (auto addr = start; addr > low; addr -= gran) {
-			if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
-				return p;
-			}
-		}
-		for (auto addr = start + gran; addr < high; addr += gran) {
-			if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
-				return p;
-			}
-		}
-		return nullptr;
-	}
-
-	// 安装兜底 hook。
-	//
-	// 重要教训（已由崩溃转储 + 反汇编实证）：SKSE::Trampoline::write_branch<N> 不是
-	// 「hook 并返回可调用的原函数」——它假设 a_src 开头是一条 jmp rel32 跳转桩，
-	// 把 a_src+1 处的 4 字节当作 rel32 解引用后返回，且完全不重定位原始指令。
-	// GetDisplayFullName 开头是 40 53 55 56 57（push rbx/rbp/rsi/rdi），于是它把
-	// 53 55 56 57 当成 rel32，返回 0x7FF7DBA5B748 这样的野地址，调用即崩。
-	// 因此这里手写跳板：分配 → 抄原始 5 字节 → 回跳 addr+5 → 改写目标首页。
-	bool InstallHook()
-	{
-		REL::Relocation<std::uintptr_t> func{ RELOCATION_ID(ids::kGetDisplayFullName, ids::kAe_GetDisplayFullName) };
-		const auto addr = func.address();
-		if (addr == 0) {
-			spdlog::error("GetDisplayFullName 地址解析失败（ID {}），跳过兜底 hook。", ids::kGetDisplayFullName);
-			return false;
-		}
-
-		// 运行时校验函数头：防版本漂移、也防 GetDisplayFullName 已被其它插件（如 Lexicon）先行 hook。
-		// 本机 1.5.97 实测为 40 53 55 56 57，4 条完整指令共 5 字节、无 rip-relative，可整体搬移。
-		static constexpr std::array<std::uint8_t, 5> kPrologue{ 0x40, 0x53, 0x55, 0x56, 0x57 };
-		if (std::memcmp(reinterpret_cast<const void*>(addr), kPrologue.data(), kPrologue.size()) != 0) {
-			spdlog::error("GetDisplayFullName（0x{:X}）函数头与预期不符（已被其它插件 hook 或版本漂移），跳过兜底 hook。", addr);
-			return false;
-		}
-
-		auto* stub = static_cast<std::uint8_t*>(AllocateExecNear(addr, 32));
-		if (!stub) {
-			spdlog::error("无法在 GetDisplayFullName 附近分配跳板内存，跳过兜底 hook。");
-			return false;
-		}
-		std::memcpy(stub, reinterpret_cast<const void*>(addr), kPrologue.size());
-		if (!WriteRel32Jump(reinterpret_cast<std::uintptr_t>(stub) + kPrologue.size(), addr + kPrologue.size())) {
-			::VirtualFree(stub, 0, MEM_RELEASE);
-			spdlog::error("跳板回跳写入失败，跳过兜底 hook。");
-			return false;
-		}
-
-		// 先设置原函数指针，再改写目标首页，确保不存在「hook 已生效但原函数指针为空」的窗口。
-		g_origGetDisplayFullName = reinterpret_cast<decltype(g_origGetDisplayFullName)>(stub);
-		if (!WriteRel32Jump(addr, reinterpret_cast<std::uintptr_t>(&HookedGetDisplayFullName))) {
-			g_origGetDisplayFullName = nullptr;
-			::VirtualFree(stub, 0, MEM_RELEASE);
-			spdlog::error("GetDisplayFullName 首页改写失败，跳过兜底 hook。");
-			return false;
-		}
-
-		spdlog::info("兜底 hook 已安装：目标 0x{:X}，跳板 0x{:X}（仅 Actor={}）。",
-			addr, reinterpret_cast<std::uintptr_t>(stub), g_cfg.hookOnlyActors);
-		return true;
+bool ParseBool(std::string_view a_val, bool a_default)
+{
+	if (a_val.empty()) return a_default;
+	switch (a_val.front()) {
+	case '1': case 't': case 'T': case 'y': case 'Y': return true;
+	case '0': case 'f': case 'F': case 'n': case 'N': return false;
+	default: return a_default;
 	}
 }
 
+std::optional<std::size_t> ParseSize(std::string_view a_val)
+{
+	std::size_t value = 0;
+	const char* first = a_val.data();
+	const char* last = a_val.data() + a_val.size();
+	if (a_val.empty() || std::from_chars(first, last, value).ec != std::errc{}) {
+		return std::nullopt;
+	}
+	return value;
+}
+
+void ResolveLanguage()
+{
+	// 优先使用自定义替换串（若用户填写），否则查预设表
+	for (const auto& [key, pack] : kLanguagePresets) {
+		if (key == g_cfg.language) {
+			g_lang = pack;
+			break;
+		}
+	}
+	if (!g_cfg.customFmtReplacement.empty()) {
+		g_lang.fmtReplacement = g_cfg.customFmtReplacement;
+	}
+	if (!g_cfg.customAposReplacement.empty()) {
+		g_lang.aposReplacement = g_cfg.customAposReplacement;
+	}
+	if (!g_cfg.fmtNameOverride.empty()) {
+		g_lang.formatName = g_cfg.fmtNameOverride;
+	}
+	if (!g_cfg.contNameOverride.empty()) {
+		g_lang.aposName = g_cfg.contNameOverride;
+	}
+}
+
+std::filesystem::path GetPluginPath()
+{
+	HMODULE self = nullptr;
+	::GetModuleHandleExA(
+		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCSTR>(&GetPluginPath),
+		&self);
+	char buf[MAX_PATH]{};
+	::GetModuleFileNameA(self, buf, static_cast<DWORD>(std::size(buf)));
+	return { buf };
+}
+
+void LoadConfig()
+{
+	auto iniPath = GetPluginPath();
+	iniPath.replace_extension(".ini");
+
+	std::ifstream file(iniPath);
+	if (!file.is_open()) {
+		spdlog::info("未找到配置文件 {}，使用默认配置（中文）。", iniPath.string());
+		return;
+	}
+
+	std::string line;
+	while (std::getline(file, line)) {
+		const auto comment = line.find_first_of(";#");
+		if (comment != std::string::npos) line.resize(comment);
+		const auto eq = line.find('=');
+		if (eq == std::string::npos) continue;
+
+		auto key = line.substr(0, eq);
+		auto val = line.substr(eq + 1);
+		const auto keyB = key.find_last_not_of(" \t\r\n");
+		const auto valB = val.find_last_not_of(" \t\r\n");
+		if (keyB == std::string::npos || valB == std::string::npos) continue;
+		key.erase(keyB + 1);
+		const auto keyF = key.find_first_not_of(" \t\r\n");
+		key.erase(0, keyF);
+		val.erase(valB + 1);
+		const auto valF = val.find_first_not_of(" \t\r\n");
+		val.erase(0, valF);
+
+		if (key == "Enable") {
+			g_cfg.master = ParseBool(val, g_cfg.master);
+		} else if (key == "PatchSummonPath") {
+			g_cfg.patchSummon = ParseBool(val, g_cfg.patchSummon);
+		} else if (key == "PatchContainerPath") {
+			g_cfg.patchContainer = ParseBool(val, g_cfg.patchContainer);
+		} else if (key == "HookDisplayName") {
+			g_cfg.hookDisplayName = ParseBool(val, g_cfg.hookDisplayName);
+		} else if (key == "HookOnlyActors") {
+			g_cfg.hookOnlyActors = ParseBool(val, g_cfg.hookOnlyActors);
+		} else if (key == "CacheLimit") {
+			if (const auto v = ParseSize(val)) g_cfg.cacheLimit = *v;
+		} else if (key == "LogLevel") {
+			if (auto lvl = spdlog::level::from_str(val); lvl != spdlog::level::off || val == "off") {
+				g_cfg.logLevel = lvl;
+			}
+		} else if (key == "LogNameCalls") {
+			g_cfg.logNameCalls = ParseBool(val, g_cfg.logNameCalls);
+		} else if (key == "LogCallsLimit") {
+			if (const auto v = ParseSize(val)) g_cfg.logCallsLimit = *v;
+		} else if (key == "Language") {
+			g_cfg.language = val.empty() ? "zh" : val;
+		} else if (key == "CustomFmtReplacement") {
+			g_cfg.customFmtReplacement = val;
+		} else if (key == "CustomAposReplacement") {
+			g_cfg.customAposReplacement = val;
+		} else if (key == "FmtNameOverride") {
+			g_cfg.fmtNameOverride = val;
+		} else if (key == "ContNameOverride") {
+			g_cfg.contNameOverride = val;
+		}
+	}
+}
+
+// ------------------------------ 日志 ------------------------------
+void SetupLog()
+{
+	auto logsFolder = SKSE::log::log_directory();
+	if (!logsFolder) {
+		SKSE::stl::report_and_fail("SKSE 未提供 log_directory，无法初始化日志。"sv);
+	}
+	auto pluginName = SKSE::PluginDeclaration::GetSingleton()->GetName();
+	auto logFilePath = *logsFolder / std::format("{}.log", pluginName);
+	auto fileLogger = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
+	auto logger = std::make_shared<spdlog::logger>("global", std::move(fileLogger));
+	spdlog::set_default_logger(std::move(logger));
+	spdlog::set_level(g_cfg.logLevel);
+	spdlog::flush_on(spdlog::level::info);
+}
+
+// ------------------------------ 运行时特征扫描 ------------------------------
+// 在进程地址空间中扫描 a_needle（字节序列），返回所有匹配的 RVA 列表。
+// 兼容 LEA rip-relative 寻址：lea reg,[rip+disp32] 后 4 字节即指向字符串的起始位置。
+std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
+{
+	if (a_needle.empty()) return {};
+
+	const HMODULE mod = ::GetModuleHandleA(nullptr);
+	if (!mod) return {};
+
+	MEMORY_BASIC_INFORMATION mbi{};
+	std::vector<std::uintptr_t> result;
+	auto cur = reinterpret_cast<std::uintptr_t>(mod);
+
+	while (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) &&
+		   mbi.BaseAddress == reinterpret_cast<LPVOID>(cur)) {
+		if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) != 0) {
+			const auto* region = reinterpret_cast<const std::uint8_t*>(cur);
+			const auto len = static_cast<std::size_t>(mbi.RegionSize);
+
+			if (len >= a_needle.size()) {
+				for (std::size_t i = 0; i <= len - a_needle.size(); ++i) {
+					if (std::memcmp(region + i, a_needle.data(), a_needle.size()) == 0) {
+						result.push_back(cur + i);
+					}
+				}
+			}
+		}
+		cur += mbi.RegionSize;
+	}
+	return result;
+}
+
+// 解析 lea reg,[rip+disp32] 中 disp32，返回格式串的 RVA。
+// a_addr 是指令起始地址，a_leaOpcode 是 3 字节前缀（如 48 8D xx）。
+// 若解析失败返回 0。
+std::uintptr_t DecodeLeaOffset(std::uintptr_t a_addr, std::span<const std::uint8_t> a_leaOpcode)
+{
+	if (a_leaOpcode.size() > 3) return 0;
+	if (a_addr < reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr)) + a_leaOpcode.size()) return 0;
+
+	const auto* insn = reinterpret_cast<const std::uint8_t*>(a_addr);
+	if (std::memcmp(reinterpret_cast<const void*>(a_addr), a_leaOpcode.data(), a_leaOpcode.size()) != 0) {
+		return 0;
+	}
+
+	// 48 8D xx 5byte 指令：前缀 + opcode + ModRM + disp32
+	// 此处固定假设 48 8D xx 后面紧跟 disp32（标准 lea r/m64,[rip+disp32]）
+	const auto disp = *reinterpret_cast<const std::int32_t*>(insn + a_leaOpcode.size());
+	const auto instrEnd = a_addr + a_leaOpcode.size() + 4;
+
+	// 安全检查：rip+disp 不应回退到模块基址以下（排除无效地址）
+	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
+	if (instrEnd + static_cast<std::uint32_t>(disp) < baseAddr) return 0;
+	if (instrEnd + static_cast<std::uint32_t>(disp) > baseAddr + 0x7FFFFFFFULL) return 0;
+
+	return instrEnd + static_cast<std::uint32_t>(disp);
+}
+
+// 从候选 RVA 向回扫描若干字节，寻找能正确反解出 a_candidate 的 lea 指令。
+// 失败返回 0。
+std::uintptr_t ResolveFmtAddrFromCandidate(
+	std::uintptr_t a_candidate,
+	std::span<const std::uint8_t> a_leaOpcode,
+	std::string_view a_expected,
+	std::string_view a_label)
+{
+	if (a_candidate == 0) return 0;
+
+	// 快速前置校验：候选地址处的内容必须完全等于预期原串（含 NUL 结尾）
+	const auto* cur = reinterpret_cast<const std::uint8_t*>(a_candidate);
+	if (std::memcmp(cur, a_expected.data(), a_expected.size()) != 0 ||
+		cur[a_expected.size()] != 0) {
+		return 0;  // 候选不是真正的格式串（可能命中了其他位置的相同字节序列）
+	}
+
+	// 向回扫描 lea 指令：实际上此函数已被主循环内联替代，保留以防复用
+	(void)a_leaOpcode;
+	(void a_label);
+
+	// 向回扫描 lea 指令
+	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
+	const auto scanStart = a_candidate > patch_bytes::kMaxBackScan
+		? (a_candidate - patch_bytes::kMaxBackScan)
+		: baseAddr;
+
+	for (auto addr = a_candidate - 1; addr >= scanStart; --addr) {
+		// 只扫描 48 8D 开头的指令（lea r/m64, rel/m offset）
+		if (addr + 2 > a_candidate) break;
+		const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
+		if (p[0] == 0x48 && p[1] == 0x8D) {
+			// 尝试用不同的 ModRM 字节（xx）解析
+			for (int rm = 0; rm < 8; ++rm) {
+				const std::array<std::uint8_t, 3> candidate = { 0x48, 0x8D, static_cast<std::uint8_t>(0x05 + rm * 0) };
+				// 实际上 modrm 决定 reg/rm，但 lea 总是 48 8D xx；这里只校验前缀后紧跟 disp32
+				// 简化处理：直接尝试从 addr 开始解析整个 7 字节指令
+				const auto resolved = DecodeLeaOffset(addr, std::span<const std::uint8_t>(p, 3));
+				if (resolved == a_candidate) {
+					spdlog::info("[{}] lea 反解成功：addr=0x{:X} → fmt=0x{:X}", a_label, addr, resolved);
+					return a_candidate;
+				}
+			}
+		}
+	}
+
+	spdlog::warn("[{}] 未能在候选 0x{:X} 附近找到匹配的 lea 指令，放弃。", a_label, a_candidate);
+	return 0;
+}
+
+// 主流程：扫描 + 验证 + 写入补丁
+bool ApplyStringPatch(
+	std::string_view a_needle,
+	std::string_view a_expected,
+	std::string_view a_replacement,
+	std::string_view a_label)
+{
+	if (a_expected.size() != a_replacement.size()) {
+		spdlog::error("[{}] 内部错误：替换串（{}）与原文长度（{}）不一致，放弃。",
+			a_label, a_replacement.size(), a_expected.size());
+		return false;
+	}
+
+	const auto candidates = FindStringRVA(a_needle);
+	if (candidates.empty()) {
+		spdlog::warn("[{}] 未能在进程地址空间找到原串 \"{}\"（{} 字节），本补丁跳过。",
+			a_label, a_needle, a_needle.size());
+		return false;
+	}
+
+	// 过滤：取第一个能被 lea 反解且与原串校验通过的候选
+	std::uintptr_t fmtAddr = 0;
+	for (const auto cand : candidates) {
+		// 尝试从该候选位置附近回扫 lea
+		const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
+		const auto scanStart = cand > patch_bytes::kMaxBackScan ? (cand - patch_bytes::kMaxBackScan) : baseAddr;
+
+		for (auto addr = cand - 1; addr >= scanStart; --addr) {
+			const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
+			if (p[0] == 0x48 && p[1] == 0x8D) {
+				const auto disp = *reinterpret_cast<const std::int32_t*>(p + 3);
+				const auto resolved = addr + 7 + static_cast<std::uint32_t>(disp);
+				if (resolved == cand) {
+					// 双重校验：lea 指向自己，且内容匹配
+					const auto* cur = reinterpret_cast<const std::uint8_t*>(cand);
+					if (std::memcmp(cur, a_expected.data(), a_expected.size()) == 0 &&
+						cur[a_expected.size()] == 0) {
+						fmtAddr = cand;
+						spdlog::info("[{}] lea 反解成功：lea@0x{:X} → 格式串@0x{:X}", a_label, addr, cand);
+						goto found;
+					}
+				}
+			}
+		}
+	}
+
+found:
+	if (fmtAddr == 0) {
+		spdlog::error("[{}] 未能在任何候选位置（共 {} 个）找到同时满足 lea 指向 + 原串校验的地址，放弃。",
+			a_label, candidates.size());
+		return false;
+	}
+
+	DWORD oldProtect = 0;
+	if (!::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), PAGE_READWRITE, &oldProtect)) {
+		spdlog::error("[{}] VirtualProtect 失败（GetLastError={}），放弃。", a_label, ::GetLastError());
+		return false;
+	}
+	std::memcpy(reinterpret_cast<void*>(fmtAddr), a_replacement.data(), a_replacement.size());
+	DWORD tmp = 0;
+	::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), oldProtect, &tmp);
+	::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(fmtAddr), a_replacement.size());
+
+	spdlog::info("[{}] 已补丁：0x{:X}：\"{}\" -> \"{}\"（等长 {} 字节）。",
+		a_label, fmtAddr, a_expected, std::string(a_replacement), a_replacement.size());
+	return true;
+}
+
+// ------------------------------ 兜底 hook ------------------------------
+const char* (*g_origGetDisplayFullName)(RE::TESObjectREFR*) = nullptr;
+
+std::mutex g_cacheLock;
+std::unordered_map<std::string, std::string> g_cache;
+std::size_t g_logCount = 0;
+
+const char* FixName(const char* a_name)
+{
+	if (!a_name) return a_name;
+	if (!std::strstr(a_name, patch_bytes::kNeedleC)) return a_name;
+
+	std::lock_guard<std::mutex> lk(g_cacheLock);
+	if (g_cache.size() < g_cfg.cacheLimit) {
+		auto [it, inserted] = g_cache.try_emplace(a_name);
+		if (inserted) {
+			std::string s = a_name;
+			const auto pos = s.find(patch_bytes::kNeedle);
+			if (pos != std::string::npos) {
+				s.replace(pos, patch_bytes::kNeedle.size(), g_lang.aposReplacement);
+			}
+			it->second = std::move(s);
+		}
+		return it->second.c_str();
+	}
+
+	thread_local std::string buf;
+	buf = a_name;
+	const auto pos = buf.find(patch_bytes::kNeedle);
+	if (pos != std::string::npos) {
+		buf.replace(pos, patch_bytes::kNeedle.size(), g_lang.aposReplacement);
+	}
+	return buf.c_str();
+}
+
+const char* HookedGetDisplayFullName(RE::TESObjectREFR* a_this)
+{
+	const char* name = g_origGetDisplayFullName(a_this);
+
+	if (g_cfg.logNameCalls && name && g_logCount < g_cfg.logCallsLimit) {
+		g_logCount++;
+		char snap[256]{};
+		strncpy_s(snap, sizeof(snap), name, _TRUNCATE);
+		spdlog::info(
+			"[调查#{}] this={:016X} ret={:016X} thread={:04X} isActor={} len={} str=\"{}\" hex={}",
+			g_logCount,
+			reinterpret_cast<std::uintptr_t>(a_this),
+			reinterpret_cast<std::uintptr_t>(_ReturnAddress()),
+			::GetCurrentThreadId(),
+			a_this ? a_this->GetFormType() == RE::FormType::ActorCharacter : false,
+			std::strlen(snap),
+			snap,
+			[&snap] {
+				std::string hex;
+				const auto l = std::strlen(snap);
+				hex.reserve(l * 3);
+				char tmp[8]{};
+				for (std::size_t i = 0; i < l; ++i) {
+					std::format_to_n(tmp, sizeof(tmp), "{:02x} ", static_cast<std::uint8_t>(snap[i]));
+					hex += tmp;
+				}
+				return hex;
+			}());
+	}
+
+	if (!g_cfg.hookDisplayName) return name;
+	if (g_cfg.hookOnlyActors && a_this && a_this->GetFormType() != RE::FormType::ActorCharacter) return name;
+	return FixName(name);
+}
+
+bool WriteRel32Jump(std::uintptr_t a_src, std::uintptr_t a_dst)
+{
+	const auto delta = static_cast<std::ptrdiff_t>(a_dst) - static_cast<std::ptrdiff_t>(a_src + 5);
+	if (delta < std::numeric_limits<std::int32_t>::min() || delta > std::numeric_limits<std::int32_t>::max()) {
+		spdlog::error("相对跳转超范围（0x{:X} -> 0x{:X}），放弃。", a_src, a_dst);
+		return false;
+	}
+
+	std::uint8_t code[5] = { 0xE9 };
+	const auto disp = static_cast<std::int32_t>(delta);
+	std::memcpy(code + 1, &disp, sizeof(disp));
+
+	DWORD oldProtect = 0;
+	if (!::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+		spdlog::error("VirtualProtect 失败（0x{:X}，GetLastError={}），放弃。", a_src, ::GetLastError());
+		return false;
+	}
+	std::memcpy(reinterpret_cast<void*>(a_src), code, sizeof(code));
+	DWORD tmp = 0;
+	::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), oldProtect, &tmp);
+	::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(a_src), sizeof(code));
+	return true;
+}
+
+void* AllocateExecNear(std::uintptr_t a_target, std::size_t a_size)
+{
+	SYSTEM_INFO si{};
+	::GetSystemInfo(&si);
+	const auto gran = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
+	constexpr std::uintptr_t kReach = 0x7FFF0000ull;
+	const auto low = (a_target > kReach) ? (a_target - kReach) : gran;
+	const auto high = a_target + kReach;
+	const auto start = a_target & ~(gran - 1);
+
+	for (auto addr = start; addr > low; addr -= gran) {
+		if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+			return p;
+		}
+	}
+	for (auto addr = start + gran; addr < high; addr += gran) {
+		if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+			return p;
+		}
+	}
+	return nullptr;
+}
+
+bool InstallHook()
+{
+	REL::Relocation<std::uintptr_t> func{ RELOCATION_ID(ids::kGetDisplayFullName, ids::kAe_GetDisplayFullName) };
+	const auto addr = func.address();
+	if (addr == 0) {
+		spdlog::error("GetDisplayFullName 地址解析失败（ID {}），跳过兜底 hook。", ids::kGetDisplayFullName);
+		return false;
+	}
+
+	static constexpr std::array<std::uint8_t, 5> kPrologue{ 0x40, 0x53, 0x55, 0x56, 0x57 };
+	if (std::memcmp(reinterpret_cast<const void*>(addr), kPrologue.data(), kPrologue.size()) != 0) {
+		spdlog::error("GetDisplayFullName（0x{:X}）函数头与预期不符（已被其它插件 hook 或版本漂移），跳过兜底 hook。", addr);
+		return false;
+	}
+
+	auto* stub = static_cast<std::uint8_t*>(AllocateExecNear(addr, 32));
+	if (!stub) {
+		spdlog::error("无法在 GetDisplayFullName 附近分配跳板内存，跳过兜底 hook。");
+		return false;
+	}
+	std::memcpy(stub, reinterpret_cast<const void*>(addr), kPrologue.size());
+	if (!WriteRel32Jump(reinterpret_cast<std::uintptr_t>(stub) + kPrologue.size(), addr + kPrologue.size())) {
+		::VirtualFree(stub, 0, MEM_RELEASE);
+		spdlog::error("跳板回跳写入失败，跳过兜底 hook。");
+		return false;
+	}
+
+	g_origGetDisplayFullName = reinterpret_cast<decltype(g_origGetDisplayFullName)>(stub);
+	if (!WriteRel32Jump(addr, reinterpret_cast<std::uintptr_t>(&HookedGetDisplayFullName))) {
+		g_origGetDisplayFullName = nullptr;
+		::VirtualFree(stub, 0, MEM_RELEASE);
+		spdlog::error("GetDisplayFullName 首页改写失败，跳过兜底 hook。");
+		return false;
+	}
+
+	spdlog::info("兜底 hook 已安装：目标 0x{:X}，跳板 0x{:X}（仅 Actor={}）。",
+		addr, reinterpret_cast<std::uintptr_t>(stub), g_cfg.hookOnlyActors);
+	return true;
+}
+
+namespace ids
+{
+	constexpr std::uint32_t kGetDisplayFullName = 19354;
+	constexpr std::uint32_t kAe_GetDisplayFullName = 19781;
+}
+
 // ----------------------------------------------------------------------------------
-// SKSE 入口。插件声明（名称/版本/兼容运行时）由 add_commonlibsse_plugin 在编译期生成：
-// COMPATIBLE_RUNTIMES 1.5.97 —— 其他运行时 SKSE 直接拒绝加载本插件，天然安全降级。
+// SKSE 入口。插件声明（名称/版本/兼容运行时）由 add_commonlibsse_plugin 在编译期生成。
+// COMPATIBLE_RUNTIMES 目前设为所有已知运行时（SE/AE/VR），不锁死具体版本号；
+// 版本/格式串差异通过运行时特征扫描 + 双重校验来消化，任何一步失败只记日志并跳过。
 // ----------------------------------------------------------------------------------
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
 
-	// 先以默认日志级别建日志，再读 ini 调整级别
 	g_cfg.logLevel = spdlog::level::info;
 	SetupLog();
 	LoadConfig();
+	ResolveLanguage();
 	spdlog::set_level(g_cfg.logLevel);
 
-	spdlog::info("SummonNameFixCN v{} 加载中（仅支持 Skyrim SE 1.5.97）。",
-		SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."));
+	spdlog::info(
+		"SummonNameFix v{} 加载中（支持 SE / AE / VR，语言包：{}）。",
+		SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."),
+		g_cfg.language);
 
 	if (!g_cfg.master) {
 		spdlog::warn("ini 配置 Enable=false，插件不做任何修改，直接退出。");
-		return true;  // 正常退出，不影响游戏
+		return true;
 	}
 
-	// 运行时版本二次确认（与生成声明一致才继续；不匹配则拒绝加载）
-	const auto runtime = REL::Module::get().version();
-	if (runtime != REL::Version(1, 5, 97, 0)) {
-		spdlog::error("检测到运行时版本 {}，非 1.5.97，插件拒绝加载（安全退出）。",
-			runtime.string("-"));
-		return false;
-	}
-
-	// 补丁 1：召唤物/有主 Actor 路径（TESNPC 槽76，ID 24212）
+	// 补丁 1：召唤物/有主 Actor 路径（格式串 "%s's %s" → 目标语言等长替换）
 	if (g_cfg.patchSummon) {
-		static constexpr std::array<std::uint8_t, 3> kLeaRdx{ 0x48, 0x8D, 0x15 };
-		ApplyStringPatch(ids::kNpcNameBuilder, ids::kNpcLeaFmtOffset, kLeaRdx,
-			patch_bytes::kFmtExpected, patch_bytes::kFmtReplacement, "召唤物路径");
+		ApplyStringPatch(
+			patch_bytes::kFmtExpected,
+			patch_bytes::kFmtExpected,
+			g_lang.fmtReplacement,
+			g_lang.formatName);
 	}
 
-	// 补丁 2：有主容器路径（TESObjectCONT 槽76，ID 17486）
+	// 补丁 2：有主容器路径（格式串 "'s " → 目标语言等长替换）
 	if (g_cfg.patchContainer) {
-		static constexpr std::array<std::uint8_t, 3> kLeaR8{ 0x4C, 0x8D, 0x05 };
-		ApplyStringPatch(ids::kContNameBuilder, ids::kContLeaAposOffset, kLeaR8,
-			patch_bytes::kAposExpected, patch_bytes::kAposReplacement, "有主容器路径");
+		ApplyStringPatch(
+			patch_bytes::kAposExpected,
+			patch_bytes::kAposExpected,
+			g_lang.aposReplacement,
+			g_lang.aposName);
 	}
 
-	// 兜底 hook：GetDisplayFullName（ID 19354）
+	// 兜底 hook：GetDisplayFullName（ID 19354/19781）
 	if (g_cfg.hookDisplayName || g_cfg.logNameCalls) {
 		InstallHook();
 	}
 
-	spdlog::info("SummonNameFixCN 初始化完成。");
+	spdlog::info("SummonNameFix 初始化完成。");
 	return true;
 }

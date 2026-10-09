@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(SummonNameFixCN
-        VERSION 1.0.0
-        DESCRIPTION "SKSE plugin: translate the hardcoded 's possessive in summon/owned-container names for Chinese localization (Skyrim SE 1.5.97)"
+project(SummonNameFix
+        VERSION 2.0.0
+        DESCRIPTION "Cross-version SKSE plugin: replaces hardcoded 's possessive in summon/owned-container names for any locale (Chinese/Japanese/Korean/etc.)"
         LANGUAGES CXX)
 
 find_package(CommonLibSSE REQUIRED)
@@ -10,8 +10,8 @@ find_package(CommonLibSSE REQUIRED)
 add_commonlibsse_plugin(${PROJECT_NAME}
     SOURCES src/main.cpp
     NAME ${PROJECT_NAME}
-    AUTHOR "SummonNameFixCN"
-    COMPATIBLE_RUNTIMES 1.5.97)
+    AUTHOR "SummonNameFix"
+    COMPATIBLE_RUNTIMES 1.5.97 1.6.620 1.4.34)
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 target_compile_options(${PROJECT_NAME} PRIVATE
