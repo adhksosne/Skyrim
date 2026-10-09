@@ -22,6 +22,7 @@ jobs:
         with:
           submodules: recursive
 
+      # 依赖（spdlog / rapidcsv）的 vcpkg 二进制缓存
       - name: Create vcpkg binary cache dir
         run: New-Item -ItemType Directory -Force vcpkg_bincache | Out-Null
 
@@ -31,6 +32,18 @@ jobs:
           path: vcpkg_bincache
           key: vcpkg-bincache-x64-windows-static-${{ hashFiles('vcpkg.json') }}
           restore-keys: vcpkg-bincache-x64-windows-static-
+
+      # 关键提速项：缓存整个 CMake 构建树。
+      # CommonLibSSE 是 500+ 源文件的大静态库，占掉绝大部分编译时间；它极少变动，
+      # 缓存后 MSBuild 只会重编改动的 main.cpp 再链接，耗时从十几分钟降到 1 分钟左右。
+      # runner 工作目录固定（D:\a\Skyrim\Skyrim），因此缓存的绝对路径可直接复用。
+      # key 只跟“构建配置”挂钩：源码改动不影响命中，交给 MSBuild 自己判断增量。
+      - name: Cache CMake build tree (incremental)
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-build-v1-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}
+          restore-keys: cmake-build-v1-
 
       # 依赖只有 spdlog / rapidcsv，全部来自 vcpkg 官方仓库（无私有 registry、无陈旧 baseline）。
       # 直接用 runner 预装的 vcpkg，避免 VS 自带 vcpkg 的行为差异与旧端口兼容问题。
@@ -56,8 +69,11 @@ jobs:
 
       - name: Build
         shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite
         run: |
-          cmake --build build --config Release *>&1 | Tee-Object -FilePath build.log
+          # --parallel：MSBuild 走多核并行（默认可能单进程），对 500+ 文件的大库影响很大
+          cmake --build build --config Release --parallel *>&1 | Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $raw = Get-Content build.log -Raw
