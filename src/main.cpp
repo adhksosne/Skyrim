@@ -1,6 +1,10 @@
-// SummonNameFix —— SKSE 插件：修复引擎硬编码的英文所有格 "'s"
+// SummonNameFix → OwnedNameLocalization（归属名本地化）
+// SKSE 插件：为"有主对象的显示名"补上本地化，修掉引擎硬编码的英文所有格 "'s"
 //
-// 现象：中文/日文/韩文等汉化后，召唤物与有主容器的名字仍显示英文所有格，例如
+// 说明：严格来说这不是一个缺陷（bug），而是引擎把英文所有格硬编码进了可执行文件，
+// 导致本地化版本里"所有者 + 所有格 + 名字"始终夹着英文 's，属于**本地化不完整**。
+//
+// 现象：中文/日文/韩文等本地化后，召唤物与有主容器的名字仍是
 //   召唤物：  "本怡's 骷髅战士"
 //   有主容器："Sven's Chest"
 //
@@ -147,7 +151,7 @@ void SetupLog()
 	std::error_code ec;
 	std::filesystem::create_directories(logsFolder, ec);
 	try {
-		const auto logFilePath = logsFolder / "SummonNameFix.log";
+		const auto logFilePath = logsFolder / "OwnedNameLocalization.log";
 		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
 		auto logger = std::make_shared<spdlog::logger>("global", std::move(sink));
 		logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
@@ -337,8 +341,8 @@ bool ApplyStringPatch(std::string_view a_expected, std::string_view a_replacemen
 // ----------------------------------------------------------------------------------
 namespace
 {
-	constexpr std::string_view kPluginName{ "SummonNameFix" };
-	constexpr std::string_view kPluginAuthor{ "SummonNameFix" };
+	constexpr std::string_view kPluginName{ "OwnedNameLocalization" };
+	constexpr std::string_view kPluginAuthor{ "adhksosne" };   // 作者名（可改成你想显示的名字）
 	constexpr REL::Version kPluginVersion{ 2, 0, 0, 0 };
 }
 
@@ -382,8 +386,8 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 	SetupLog();
 
 	const auto runtime = a_skse->RuntimeVersion();
-	spdlog::info("SummonNameFix v{} build={}（编译于 {} {}）",
-		kPluginVersion.string("."), PLUGIN_BUILD_ID, __DATE__, __TIME__);
+	spdlog::info("{} v{} build={}（编译于 {} {}）",
+		kPluginName, kPluginVersion.string("."), PLUGIN_BUILD_ID, __DATE__, __TIME__);
 	spdlog::info("已加载模块：{}", GetPluginPath().string());
 	spdlog::info("运行时 {}。", runtime.string());
 
@@ -399,6 +403,6 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 	// 补丁 2：有主容器的名字组装（独立所有格串，strcat 拼接）
 	ApplyStringPatch(patch_bytes::kAposExpected, g_lang.apos, "有主容器路径");
 
-	spdlog::info("SummonNameFix 初始化完成。");
+	spdlog::info("{} 初始化完成。", kPluginName);
 	return true;
 }

@@ -8,10 +8,9 @@ if(NOT DEFINED VCPKG_TARGET_TRIPLET)
 	set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "")
 endif()
 
-project(SummonNameFix VERSION 2.0.0 LANGUAGES CXX)
+project(OwnedNameLocalization VERSION 2.0.0 LANGUAGES CXX)
 
-set(PLUGIN_NAME "SummonNameFix" CACHE STRING "生成的 SKSE 插件 DLL 名称")
-set(PLUGIN_AUTHOR "SummonNameFix" CACHE STRING "SKSE 中显示的插件作者")
+set(PLUGIN_NAME "OwnedNameLocalization" CACHE STRING "生成的 SKSE 插件 DLL 名称")
 # 构建指纹：CI 传入 commit SHA，日志启动时会打印，用于确认实际加载的是哪次构建
 set(PLUGIN_BUILD_ID "dev" CACHE STRING "Build identifier (e.g. git commit)")
 
