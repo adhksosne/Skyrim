@@ -12,6 +12,8 @@ project(SummonNameFix VERSION 2.0.0 LANGUAGES CXX)
 
 set(PLUGIN_NAME "SummonNameFix" CACHE STRING "生成的 SKSE 插件 DLL 名称")
 set(PLUGIN_AUTHOR "SummonNameFix" CACHE STRING "SKSE 中显示的插件作者")
+# 构建指纹：CI 传入 commit SHA，日志启动时会打印，用于确认实际加载的是哪次构建
+set(PLUGIN_BUILD_ID "dev" CACHE STRING "Build identifier (e.g. git commit)")
 
 # UNIVERSAL：一个 DLL 同时支持 SE 1.5.97、AE 1.6/1.7 与 VR 1.4.15（布局差异在运行时选择）。
 set(SKYRIM_VARIANT "UNIVERSAL" CACHE STRING "Skyrim runtime variant: UNIVERSAL, SE, AE, or VR")
@@ -57,7 +59,8 @@ add_library(${PLUGIN_NAME} SHARED src/main.cpp)
 target_compile_features(${PLUGIN_NAME} PRIVATE cxx_std_23)
 target_compile_definitions(${PLUGIN_NAME} PRIVATE
 	WIN32_LEAN_AND_MEAN
-	NOMINMAX)
+	NOMINMAX
+	PLUGIN_BUILD_ID="${PLUGIN_BUILD_ID}")
 target_link_libraries(${PLUGIN_NAME} PRIVATE ${COMMONLIB_NAME}::${COMMONLIB_NAME})
 if(MSVC)
 	target_compile_options(${PLUGIN_NAME} PRIVATE

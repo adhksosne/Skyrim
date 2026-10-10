@@ -57,7 +57,8 @@ jobs:
           Write-Host "vcpkg root: $vcpkgRoot"
           cmake -S . -B build -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" `
-            -DSKYRIM_VARIANT=UNIVERSAL *>&1 | Tee-Object -FilePath configure.log
+            -DSKYRIM_VARIANT=UNIVERSAL `
+            -DPLUGIN_BUILD_ID="${{ github.sha }}" *>&1 | Tee-Object -FilePath configure.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $raw = Get-Content configure.log -Raw

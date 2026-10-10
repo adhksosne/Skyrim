@@ -46,6 +46,12 @@
 #include <unordered_map>
 #include <vector>
 
+// 构建指纹：CI 通过 -DPLUGIN_BUILD_ID=<commit sha> 注入；本地构建为 "dev"。
+// 日志启动时会打印它，用来确认实际被加载的到底是哪一次构建。
+#ifndef PLUGIN_BUILD_ID
+#define PLUGIN_BUILD_ID "dev"
+#endif
+
 // ----------------------------------------------------------------------------------
 // 配置与常量
 // ----------------------------------------------------------------------------------
@@ -837,8 +843,10 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 	SetupLog();
 
 	const auto runtime = a_skse->RuntimeVersion();
-	spdlog::info("SummonNameFix v{} 开始加载：运行时 {}。",
-		kPluginVersion.string("."), runtime.string());
+	spdlog::info("SummonNameFix v{} build={}（编译于 {} {}）",
+		kPluginVersion.string("."), PLUGIN_BUILD_ID, __DATE__, __TIME__);
+	spdlog::info("已加载模块：{}", GetPluginPath().string());
+	spdlog::info("运行时 {}。", runtime.string());
 
 	// 与 v1 保持一致：无条件 SKSE::Init。
 	// 关键点：地址库的 ID 数据库是在 SKSE::Init 里装载的；不调用 Init，
