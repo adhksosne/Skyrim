@@ -1,4 +1,4 @@
-# 归属名本地化 · OwnedNameLocalization
+# 归属名本地化 · PossessiveLocalization
 
 给「有主对象」的显示名补上本地化：把引擎**硬编码的英文所有格 `'s`** 换成本地语言的所有格标记。
 
@@ -18,12 +18,12 @@
 ## 安装
 
 1. 安装 [SKSE64](https://skse.silverlock.org/)。
-2. 把 `OwnedNameLocalization.dll` 与 `OwnedNameLocalization.ini` 放进 `Data/SKSE/Plugins/`（MO2 用户直接作为普通 mod 安装即可）。
+2. 把 `PossessiveLocalization.dll` 与 `PossessiveLocalization.ini` 放进 `Data/SKSE/Plugins/`（MO2 用户直接作为普通 mod 安装即可）。
 3. 需要哪种语言，就在 ini 里把 `Language` 改成 `zh` / `ja` / `ko` 后重启游戏。
 
 就这三步。**同一个 DLL 同时支持 SE 1.5.x / AE 1.6.x / VR 1.4.x**，不需要按版本挑文件。
 
-## 配置（`OwnedNameLocalization.ini`）
+## 配置（`PossessiveLocalization.ini`）
 
 只有一个有效配置项：
 
@@ -33,7 +33,7 @@
 | `CustomAposReplacement` | （空） | 可选：自定义 **3 字节 UTF-8** 标记，填写后覆盖 `Language` |
 
 整份 ini 删掉也能用（默认中文）。日志写在
-`文档\My Games\Skyrim Special Edition\SKSE\OwnedNameLocalization.log`。
+`文档\My Games\Skyrim Special Edition\SKSE\PossessiveLocalization.log`。
 
 ## 工作原理
 
@@ -86,10 +86,10 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
   -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
 cmake --build build
-# 产物：build/OwnedNameLocalization.dll
+# 产物：build/PossessiveLocalization.dll
 ```
 
-也可以直接用 GitHub Actions 云编译：push 后到 Actions 页下载 `OwnedNameLocalization` 工件。
+也可以直接用 GitHub Actions 云编译：push 后到 Actions 页下载 `PossessiveLocalization` 工件。
 
 ## License
 
@@ -100,7 +100,7 @@ MIT（CommonLibSSE-NG 采用其自身许可）。
 <details>
 <summary>English</summary>
 
-**OwnedNameLocalization** — an SKSE plugin that completes the localization of owned-object
+**PossessiveLocalization** — an SKSE plugin that completes the localization of owned-object
 display names by replacing the engine's hardcoded English possessive `'s`
 (`"%s's %s"` and `"'s "`, both compiled into `SkyrimSE.exe`) with the possessive marker of
 the target language: `zh` 的, `ja` の, `ko` 의.

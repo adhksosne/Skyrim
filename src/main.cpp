@@ -1,4 +1,4 @@
-// SummonNameFix → OwnedNameLocalization（归属名本地化）
+// PossessiveLocalization（归属名本地化 / 所有格本地化）
 // SKSE 插件：为"有主对象的显示名"补上本地化，修掉引擎硬编码的英文所有格 "'s"
 //
 // 说明：严格来说这不是一个缺陷（bug），而是引擎把英文所有格硬编码进了可执行文件，
@@ -151,7 +151,7 @@ void SetupLog()
 	std::error_code ec;
 	std::filesystem::create_directories(logsFolder, ec);
 	try {
-		const auto logFilePath = logsFolder / "OwnedNameLocalization.log";
+		const auto logFilePath = logsFolder / "PossessiveLocalization.log";
 		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
 		auto logger = std::make_shared<spdlog::logger>("global", std::move(sink));
 		logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
@@ -341,7 +341,7 @@ bool ApplyStringPatch(std::string_view a_expected, std::string_view a_replacemen
 // ----------------------------------------------------------------------------------
 namespace
 {
-	constexpr std::string_view kPluginName{ "OwnedNameLocalization" };
+	constexpr std::string_view kPluginName{ "PossessiveLocalization" };
 	constexpr std::string_view kPluginAuthor{ "adhksosne" };   // 作者名（可改成你想显示的名字）
 	constexpr REL::Version kPluginVersion{ 2, 0, 0, 0 };
 }

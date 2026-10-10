@@ -82,8 +82,8 @@ jobs:
         shell: pwsh
         run: |
           $sha = "${{ github.sha }}"
-          $dll = Get-ChildItem -Recurse -Path build -Filter "OwnedNameLocalization.dll" | Select-Object -First 1
-          if (-not $dll) { Write-Error "构建产物 OwnedNameLocalization.dll 未找到"; exit 1 }
+          $dll = Get-ChildItem -Recurse -Path build -Filter "PossessiveLocalization.dll" | Select-Object -First 1
+          if (-not $dll) { Write-Error "构建产物 PossessiveLocalization.dll 未找到"; exit 1 }
           $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($dll.FullName))
           if (-not $text.Contains($sha)) {
             Write-Host "::error title=stale binary::生成的 DLL 不含本次提交指纹 $sha，说明链接了旧目标文件"
@@ -94,19 +94,19 @@ jobs:
       - name: Collect artifacts
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $dll = Get-ChildItem -Recurse -Path build -Filter "OwnedNameLocalization.dll" |
+          $dll = Get-ChildItem -Recurse -Path build -Filter "PossessiveLocalization.dll" |
             Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
           if (-not $dll) {
-            $dll = Get-ChildItem -Recurse -Path build -Filter "OwnedNameLocalization.dll" | Select-Object -First 1
+            $dll = Get-ChildItem -Recurse -Path build -Filter "PossessiveLocalization.dll" | Select-Object -First 1
           }
-          if (-not $dll) { Write-Error "构建产物 OwnedNameLocalization.dll 未找到"; exit 1 }
+          if (-not $dll) { Write-Error "构建产物 PossessiveLocalization.dll 未找到"; exit 1 }
           Copy-Item $dll.FullName dist/
-          Copy-Item data/OwnedNameLocalization.ini dist/
+          Copy-Item data/PossessiveLocalization.ini dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           # 单个 DLL 同时支持 SE / AE / VR，无需按版本分开构建
-          name: OwnedNameLocalization
+          name: PossessiveLocalization
           path: dist/
           if-no-files-found: error
