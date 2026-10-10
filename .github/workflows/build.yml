@@ -33,17 +33,10 @@ jobs:
           key: vcpkg-bincache-x64-windows-static-${{ hashFiles('vcpkg.json') }}
           restore-keys: vcpkg-bincache-x64-windows-static-
 
-      # 关键提速项：缓存整个 CMake 构建树。
-      # CommonLibSSE 是 500+ 源文件的大静态库，占掉绝大部分编译时间；它极少变动，
-      # 缓存后 MSBuild 只会重编改动的 main.cpp 再链接，耗时从十几分钟降到 1 分钟左右。
-      # runner 工作目录固定（D:\a\Skyrim\Skyrim），因此缓存的绝对路径可直接复用。
-      # key 只跟“构建配置”挂钩：源码改动不影响命中，交给 MSBuild 自己判断增量。
-      - name: Cache CMake build tree (incremental)
-        uses: actions/cache@v4
-        with:
-          path: build
-          key: cmake-build-v1-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}
-          restore-keys: cmake-build-v1-
+      # 注意：这里刻意【不再】缓存 CMake 构建树。
+      # 之前为了提速缓存过 build/ 并刷新过产物时间戳，结果 MSBuild 认为 main.cpp 无需重编，
+      # 连续多次 CI 都链接了缓存里的旧 main.cpp.obj —— 产出的 DLL 一直是旧代码（严重错误）。
+      # 现在每次都全新构建，保证 DLL 与源码一致；后续若要提速将改用内容哈希的编译器缓存(sccache)。
 
       # 依赖只有 spdlog / rapidcsv，全部来自 vcpkg 官方仓库（无私有 registry、无陈旧 baseline）。
       # 直接用 runner 预装的 vcpkg，避免 VS 自带 vcpkg 的行为差异与旧端口兼容问题。
@@ -68,17 +61,6 @@ jobs:
             exit 1
           }
 
-      # 缓存恢复出来的 .obj/.lib/.pch 时间戳会早于本次 checkout 的源码，
-      # MSBuild 因此判定“输出过期”并全量重编（这就是缓存命中了却还要 12 分钟的原因）。
-      # 这里把这些产物时间戳刷新到最新，让它正确走增量编译。
-      - name: Refresh cached build outputs timestamps
-        shell: pwsh
-        run: |
-          if (Test-Path build) {
-            Get-ChildItem build -Recurse -File -Include *.obj,*.lib,*.pch,*.res -ErrorAction SilentlyContinue |
-              ForEach-Object { $_.LastWriteTime = Get-Date }
-          }
-
       - name: Build
         shell: pwsh
         env:
@@ -93,6 +75,21 @@ jobs:
             Write-Host ("::error title=CMake build failed::" + ($raw -replace "`r?`n", "%0A"))
             exit 1
           }
+
+      # 防止再次产出“旧二进制”：DLL 里必须含有本次提交的指纹（由 PLUGIN_BUILD_ID 注入）。
+      # 若链接到了缓存/旧的目标文件，这里会直接让 CI 失败，而不是把旧 DLL 发出去。
+      - name: Verify built DLL carries this commit id
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}"
+          $dll = Get-ChildItem -Recurse -Path build -Filter "SummonNameFix.dll" | Select-Object -First 1
+          if (-not $dll) { Write-Error "构建产物 SummonNameFix.dll 未找到"; exit 1 }
+          $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($dll.FullName))
+          if (-not $text.Contains($sha)) {
+            Write-Host "::error title=stale binary::生成的 DLL 不含本次提交指纹 $sha，说明链接了旧目标文件"
+            exit 1
+          }
+          Write-Host "指纹校验通过：$($dll.FullName) 含 build=$sha"
 
       - name: Collect artifacts
         run: |
