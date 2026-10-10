@@ -313,8 +313,13 @@ void SetupLog()
 }
 
 // ------------------------------ 运行时特征扫描 ------------------------------
-// 在进程地址空间中扫描 a_needle（字节序列），返回所有匹配的 RVA 列表。
-// 兼容 LEA rip-relative 寻址：lea reg,[rip+disp32] 后 4 字节即指向字符串的起始位置。
+// 在进程地址空间里扫描“真正的字符串字面量” a_needle。
+// 命中必须满足两个条件，避免误改：
+//   1) 起点：前一个字节是 NUL（上一串的结尾），或紧接 UTF-8 BOM（EF BB BF）；
+//   2) 终点：字面量以 NUL 结束。
+// 注意：这里刻意不做“往回找 lea”的校验 —— 引用字符串的 lea 指令位于代码段(.text)，
+// 而字符串位于数据段(.rdata)，两者在地址上并不相邻，往回扫永远不会命中。
+// v1 是用地址库 ID + 函数内偏移定位 lea 反解出同一个字符串，效果等价。
 std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 {
 	if (a_needle.empty()) return {};
@@ -328,13 +333,26 @@ std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 
 	while (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) &&
 		   mbi.BaseAddress == reinterpret_cast<LPVOID>(cur)) {
-		if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) != 0) {
+		// 同时覆盖 PAGE_READONLY(.rdata) / PAGE_READWRITE / PAGE_EXECUTE_READ
+		if (mbi.State == MEM_COMMIT &&
+			(mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ)) != 0) {
 			const auto* region = reinterpret_cast<const std::uint8_t*>(cur);
 			const auto len = static_cast<std::size_t>(mbi.RegionSize);
 
-			if (len >= a_needle.size()) {
-				for (std::size_t i = 0; i <= len - a_needle.size(); ++i) {
-					if (std::memcmp(region + i, a_needle.data(), a_needle.size()) == 0) {
+			if (len > a_needle.size()) {
+				for (std::size_t i = 0; i + a_needle.size() < len; ++i) {
+					if (std::memcmp(region + i, a_needle.data(), a_needle.size()) != 0) {
+						continue;
+					}
+					// 终点：必须是完整的字面量（后面紧跟 NUL）
+					if (region[i + a_needle.size()] != 0) {
+						continue;
+					}
+					// 起点：前一字节为 NUL，或紧接 UTF-8 BOM（可能带 BOM 的 exe 变体）
+					const bool atLiteralStart =
+						(i == 0) || (region[i - 1] == 0) ||
+						(i >= 3 && region[i - 1] == 0xBF && region[i - 2] == 0xBB && region[i - 3] == 0xEF);
+					if (atLiteralStart) {
 						result.push_back(cur + i);
 					}
 				}
@@ -436,54 +454,17 @@ bool ApplyStringPatch(
 
 	const auto candidates = FindStringRVA(a_needle);
 	if (candidates.empty()) {
-		spdlog::warn("[{}] 未能在进程地址空间找到原串 \"{}\"（{} 字节），本补丁跳过。",
+		spdlog::error("[{}] 未在进程地址空间找到字符串字面量 \"{}\"（{} 字节），本补丁跳过。",
 			a_label, a_needle, a_needle.size());
 		return false;
 	}
 
-	// 第一步：先筛出“内容与原串完全一致（含尾随 NUL）”的候选 —— 这是写入的必要条件。
-	std::vector<std::uintptr_t> exactMatches;
-	std::vector<std::uintptr_t> leaVerified;
-	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-
-	for (const auto cand : candidates) {
-		const auto* cur = reinterpret_cast<const std::uint8_t*>(cand);
-		if (std::memcmp(cur, a_expected.data(), a_expected.size()) != 0 ||
-			cur[a_expected.size()] != 0) {
-			continue;   // 命中了相同字节序列但不是真正的格式串
-		}
-		exactMatches.push_back(cand);
-
-		// 第二步（加强证据）：在候选之前回扫 lea reg,[rip+disp32]，且反解结果正好指向候选。
-		const auto scanStart = cand > patch_bytes::kMaxBackScan ? (cand - patch_bytes::kMaxBackScan) : baseAddr;
-		for (auto addr = cand - 1; addr >= scanStart; --addr) {
-			const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
-			// 48 8D + ModRM(mod=00, rm=101 → RIP 相对) 才是 lea reg,[rip+disp32]
-			if (p[0] == 0x48 && p[1] == 0x8D && (p[2] & 0xC7) == 0x05) {
-				const auto disp = *reinterpret_cast<const std::int32_t*>(p + 3);
-				const auto resolved = static_cast<std::uintptr_t>(
-					static_cast<std::int64_t>(addr) + 7 + static_cast<std::int64_t>(disp));
-				if (resolved == cand) {
-					leaVerified.push_back(cand);
-					spdlog::info("[{}] lea 反解成功：lea@0x{:X} → 格式串@0x{:X}", a_label, addr, cand);
-					break;
-				}
-			}
-			if (addr == scanStart) break;   // 防止无符号下溢
-		}
-	}
-
-	// 有 lea 证据就用 lea 证据；没有就退回“原串精确匹配”。
-	// 注意：v1 是直接改已知地址、并没有这一步 lea 校验，所以这里绝不能因为找不到 lea 就整体放弃。
-	const auto& targets = leaVerified.empty() ? exactMatches : leaVerified;
-	if (leaVerified.empty()) {
-		spdlog::warn("[{}] 候选 {} 个，其中 {} 个与原串完全一致，但附近未找到可反解的 lea；按原串精确匹配定位写入。",
-			a_label, candidates.size(), exactMatches.size());
-	}
-	if (targets.empty()) {
-		spdlog::error("[{}] 候选 {} 个，但没有一个的内容与预期原串完全一致，放弃。", a_label, candidates.size());
-		return false;
-	}
+	// FindStringRVA 已经完成“完整字面量”校验（起点边界 + 尾随 NUL），直接写入即可。
+	// 不再做“往回找 lea”：引用该字符串的 lea 在 .text，字符串在 .rdata，两者不相邻，
+	// 往回扫命中率为 0（v1 是靠地址库 ID + 函数内偏移定位 lea，效果等价）。
+	const auto& targets = candidates;
+	spdlog::info("[{}] 找到 {} 处字符串字面量 \"{}\"（{} 字节），开始等长替换。",
+		a_label, targets.size(), a_expected, a_expected.size());
 
 	std::size_t patched = 0;
 	for (const auto fmtAddr : targets) {
