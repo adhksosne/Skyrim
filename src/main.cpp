@@ -1,48 +1,40 @@
-// SummonNameFix —— SKSE 插件：跨版本（SE / AE / VR）修复召唤物与有主容器名称中的硬编码所有格
+// SummonNameFix —— SKSE 插件：修复引擎硬编码的英文所有格 "'s"
 //
-// 功能：检测并 patch 引擎内硬编码的所有格格式字符串，使其与 INI 配置的目标语言匹配。
-//   默认（中文）：
-//     召唤物路径："%s's %s" → "%s的%s"
-//     容器路径  ："'s "     → "的"
-//   用户可通过 INI 配置任意目标语言（日文「の」、韩文「의」、德语「's」→ "'s」等）。
+// 现象：中文/日文/韩文等汉化后，召唤物与有主容器的名字仍显示英文所有格，例如
+//   召唤物：  "本怡's 骷髅战士"
+//   有主容器："Sven's Chest"
 //
-// 原理（详见 REPORT.md）：
-//   1) 调用 FindStringPattern 在进程地址空间扫描已知英文原串（支持带/不带 UTF-8 BOM 两种常见变体）。
-//      找到后向回扫描若干字节内的 lea reg,[rip+disp32]（48 8D xx 5byte），反解出原始格式串地址。
-//   2) 校验原串完全等于预期格式（含尾随 NUL），确认后再等长替换为 INI 配置的目标串。
-//   3) 可选 hook TESObjectREFR::GetDisplayFullName（Address Library REL ID 19354/19781）
-//      兜底处理 Papyrus SetDisplayName 等运行时构造的含原串的名字。
+// 原理（全部经实际 exe 字节取证验证，详见 REPORT.md）：
+//   引擎把"所有者 + 所有格 + 名字"拼起来时，用的是编译进 SkyrimSE.exe 的两个字符串字面量：
+//     1) "%s's %s"   —— printf 式复合格式（召唤物 / 有主 Actor 的名字组装）
+//     2) "'s "       —— 独立串，strcat 拼接（有主容器的名字组装）
+//   它们属于可执行映像（.rdata），**不在任何 ESP/ESM/Papyrus 数据里**，所以汉化包改不到，
+//   只能由 SKSE 插件在运行时把内存里这两串等长改掉。
+//   实测：两串在全 exe 中各仅出现 1 次、且前一字节均为 0x00（标准字面量起点），
+//   因此按"完整字面量"精确定位即可，不需要地址库/偏移，也不会误伤。
 //
-// 兼容性说明：
-//   - 不依赖任何已发布的 Address Library ID（24212 / 17486 仅在旧版 REPORT 中作为记录）；
-//     全部通过运行时特征扫描动态定位，理论上覆盖所有包含相同格式串的运行时（SE 1.x / AE 1.6.x / VR 1.4.x）。
-//   - 核心补丁（格式串扫描 + 等长替换）为纯 Win32 实现，不依赖 Address Library；
-//     仅可选的 GetDisplayFullName 兜底 hook 需要地址库（缺失时记录日志并跳过）。
-//   - 任何一步（找不到原串、lea 偏移不符、原串校验失败、VirtualProtect 失败）都会记录日志并跳过该补丁，
-//     保证不会因版本漂移误写任意字节。
+// 硬性约束：不依赖 ESP/ESL/ESM、不用 Papyrus、不改存档；不需要 Address Library。
+//   任何一步不符预期（找不到字面量、长度不等、内存不可写）都只记日志并跳过，绝不含错改写。
 
-#include "RE/T/TESObjectREFR.h"
 #include "SKSE/SKSE.h"
 
 #include <Windows.h>
-#include <intrin.h>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/logger.h>
 
-#include <charconv>
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
-#include <format>
 #include <fstream>
-#include <functional>
 #include <iterator>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // 构建指纹：CI 通过 -DPLUGIN_BUILD_ID=<commit sha> 注入；本地构建为 "dev"。
@@ -52,116 +44,53 @@
 #endif
 
 // ----------------------------------------------------------------------------------
-// 配置与常量
+// 待替换的引擎原串
 // ----------------------------------------------------------------------------------
 namespace patch_bytes
 {
-	// 英文原串（两个路径）——作为特征匹配的种子，实测在 exe 中均仅 1 处
+	// 全 exe 各仅 1 处；等长替换：7 字节 -> 7 字节，3 字节 -> 3 字节
 	constexpr std::string_view kFmtExpected{ "%s's %s", 7 };
 	constexpr std::string_view kAposExpected{ "'s ", 3 };
 
-	// strstr 快速针（含尾随空格；拼接处必为 "'s "）
-	constexpr std::string_view kNeedle{ "'s ", 3 };
-	constexpr const char* kNeedleC = "'s ";
+	// 所有格标记固定 3 字节时，"%s<标记>%s" 恰好也是 7 字节，与原格式串等长，
+	// 因此格式串可以由标记推导，配置里只需要一项"目标语言"。
+	constexpr std::size_t kMarkerBytes = 3;
+	constexpr std::size_t kFmtBytes = 7;
 }
 
-// 语言包默认值（中文）
-struct LanguagePack
-{
-	std::string fmtReplacement = "%s\xe7\x9a\x84%s";   // "%s的%s"（7 字节）
-	std::string aposReplacement = "\xe7\x9a\x84";       // "的"（3 字节）
-	std::string formatName = "召唤物路径";
-	std::string aposName = "有主容器路径";
-};
-
-// 多语言预设（key 即 ini 里的 Language 字段值）
-// 注意：LanguagePack 内含 std::string，MSVC 无法在常量求值中构造（C2178/C7595），
-// 因此这里用运行期初始化的静态表，而不是 consteval/constexpr。
-std::array<std::pair<std::string_view, LanguagePack>, 4> MakePresets()
-{
-	return {{
-		// 中文
-		{ "zh", { "%s\xe7\x9a\x84%s", "\xe7\x9a\x84", "召唤物路径", "有主容器路径" } },
-		// 日文：の = E3 of E no E (0xE3 0x81 0xAE)，长度 3
-		{ "ja", { "%s\xe3\x81\xae%s", "\xe3\x81\xae", "召喚物パス", "コンテナパス" } },
-		// 韩文：의 = EC 9c 9c (0xEC 0x9C 0x9C)，长度 3
-		{ "ko", { "%s\xec\x9c\x9c%s", "\xec\x9c\x9c", "소환경로", "컨테이너경로" } },
-		// 德语：保留英文 's 不变（仅作为对比测试/德语不替换场景）
-		{ "de", { "%s's %s", "'s ", "npc_path", "cont_path" } },
-	}};
-}
-
+// ----------------------------------------------------------------------------------
+// 语言预设：key（ini 里的 Language）→ 3 字节 UTF-8 所有格标记
+// ----------------------------------------------------------------------------------
 namespace
 {
-	const auto kLanguagePresets = MakePresets();
+	constexpr std::array<std::pair<std::string_view, std::string_view>, 4> kLanguagePresets{ {
+		{ "zh", "\xE7\x9A\x84" },        // 的
+		{ "ja", "\xE3\x81\xAE" },        // の
+		{ "ko", "\xEC\x9C\x9C" },        // 의
+		{ "de", "'s " },                 // 德文保持英文所有格（仅作对照）
+	} };
+
+	constexpr std::string_view kDefaultLanguage = "zh";
+
+	struct Config
+	{
+		std::string language{ kDefaultLanguage };   // Language：zh / ja / ko / de
+		std::string customApos;                     // CustomAposReplacement：自定义 3 字节标记（覆盖预设）
+	};
+
+	struct Language
+	{
+		std::string apos{ "\xE7\x9A\x84" };   // 3 字节所有格标记
+		std::string fmt{ "%s\xE7\x9A\x84%s" };  // 7 字节格式串（由标记推导）
+	};
+
+	Config g_cfg;
+	Language g_lang;
 }
 
-// ------------------------------ 配置 ------------------------------
-struct Config
-{
-	bool master = true;
-	bool patchSummon = true;
-	bool patchContainer = true;
-	bool hookDisplayName = false;
-	bool hookOnlyActors = true;
-	std::size_t cacheLimit = 4096;
-	spdlog::level::level_enum logLevel = spdlog::level::info;
-	bool logNameCalls = false;
-	std::size_t logCallsLimit = 200;
-	std::string language = "zh";   // 默认中文
-	std::string customFmtReplacement;
-	std::string customAposReplacement;
-	std::string fmtNameOverride;
-	std::string contNameOverride;
-};
-
-Config g_cfg;
-LanguagePack g_lang;
-
-bool ParseBool(std::string_view a_val, bool a_default)
-{
-	if (a_val.empty()) return a_default;
-	switch (a_val.front()) {
-	case '1': case 't': case 'T': case 'y': case 'Y': return true;
-	case '0': case 'f': case 'F': case 'n': case 'N': return false;
-	default: return a_default;
-	}
-}
-
-std::optional<std::size_t> ParseSize(std::string_view a_val)
-{
-	std::size_t value = 0;
-	const char* first = a_val.data();
-	const char* last = a_val.data() + a_val.size();
-	if (a_val.empty() || std::from_chars(first, last, value).ec != std::errc{}) {
-		return std::nullopt;
-	}
-	return value;
-}
-
-void ResolveLanguage()
-{
-	// 优先使用自定义替换串（若用户填写），否则查预设表
-	for (const auto& [key, pack] : kLanguagePresets) {
-		if (key == g_cfg.language) {
-			g_lang = pack;
-			break;
-		}
-	}
-	if (!g_cfg.customFmtReplacement.empty()) {
-		g_lang.fmtReplacement = g_cfg.customFmtReplacement;
-	}
-	if (!g_cfg.customAposReplacement.empty()) {
-		g_lang.aposReplacement = g_cfg.customAposReplacement;
-	}
-	if (!g_cfg.fmtNameOverride.empty()) {
-		g_lang.formatName = g_cfg.fmtNameOverride;
-	}
-	if (!g_cfg.contNameOverride.empty()) {
-		g_lang.aposName = g_cfg.contNameOverride;
-	}
-}
-
+// ----------------------------------------------------------------------------------
+// 路径工具（全部基于模块/已知文件夹，不依赖当前工作目录）
+// ----------------------------------------------------------------------------------
 std::filesystem::path GetPluginPath()
 {
 	HMODULE self = nullptr;
@@ -169,77 +98,12 @@ std::filesystem::path GetPluginPath()
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 		reinterpret_cast<LPCWSTR>(&GetPluginPath),
 		&self);
-	// 用宽字符 API：Mod Organizer 的 mod 路径常含非 ASCII 字符
+	// 宽字符 API：Mod Organizer 的 mod 路径常含非 ASCII 字符
 	wchar_t buf[MAX_PATH]{};
 	::GetModuleFileNameW(self, buf, static_cast<DWORD>(std::size(buf)));
 	return { buf };
 }
 
-void LoadConfig()
-{
-	auto iniPath = GetPluginPath();
-	iniPath.replace_extension(".ini");
-
-	std::ifstream file(iniPath);
-	if (!file.is_open()) {
-		spdlog::info("未找到配置文件 {}，使用默认配置（中文）。", iniPath.string());
-		return;
-	}
-
-	std::string line;
-	while (std::getline(file, line)) {
-		const auto comment = line.find_first_of(";#");
-		if (comment != std::string::npos) line.resize(comment);
-		const auto eq = line.find('=');
-		if (eq == std::string::npos) continue;
-
-		auto key = line.substr(0, eq);
-		auto val = line.substr(eq + 1);
-		const auto keyB = key.find_last_not_of(" \t\r\n");
-		const auto valB = val.find_last_not_of(" \t\r\n");
-		if (keyB == std::string::npos || valB == std::string::npos) continue;
-		key.erase(keyB + 1);
-		const auto keyF = key.find_first_not_of(" \t\r\n");
-		key.erase(0, keyF);
-		val.erase(valB + 1);
-		const auto valF = val.find_first_not_of(" \t\r\n");
-		val.erase(0, valF);
-
-		if (key == "Enable") {
-			g_cfg.master = ParseBool(val, g_cfg.master);
-		} else if (key == "PatchSummonPath") {
-			g_cfg.patchSummon = ParseBool(val, g_cfg.patchSummon);
-		} else if (key == "PatchContainerPath") {
-			g_cfg.patchContainer = ParseBool(val, g_cfg.patchContainer);
-		} else if (key == "HookDisplayName") {
-			g_cfg.hookDisplayName = ParseBool(val, g_cfg.hookDisplayName);
-		} else if (key == "HookOnlyActors") {
-			g_cfg.hookOnlyActors = ParseBool(val, g_cfg.hookOnlyActors);
-		} else if (key == "CacheLimit") {
-			if (const auto v = ParseSize(val)) g_cfg.cacheLimit = *v;
-		} else if (key == "LogLevel") {
-			if (auto lvl = spdlog::level::from_str(val); lvl != spdlog::level::off || val == "off") {
-				g_cfg.logLevel = lvl;
-			}
-		} else if (key == "LogNameCalls") {
-			g_cfg.logNameCalls = ParseBool(val, g_cfg.logNameCalls);
-		} else if (key == "LogCallsLimit") {
-			if (const auto v = ParseSize(val)) g_cfg.logCallsLimit = *v;
-		} else if (key == "Language") {
-			g_cfg.language = val.empty() ? "zh" : val;
-		} else if (key == "CustomFmtReplacement") {
-			g_cfg.customFmtReplacement = val;
-		} else if (key == "CustomAposReplacement") {
-			g_cfg.customAposReplacement = val;
-		} else if (key == "FmtNameOverride") {
-			g_cfg.fmtNameOverride = val;
-		} else if (key == "ContNameOverride") {
-			g_cfg.contNameOverride = val;
-		}
-	}
-}
-
-// 游戏根目录（exe 所在目录）。用于判断 Steam / GOG / VR，不依赖当前工作目录。
 std::optional<std::filesystem::path> GetGameRoot()
 {
 	const HMODULE exe = ::GetModuleHandleW(nullptr);
@@ -250,18 +114,15 @@ std::optional<std::filesystem::path> GetGameRoot()
 	return std::filesystem::path{ buf }.parent_path();
 }
 
-// 规范日志目录：<文档>\My Games\<版本>\SKSE
-// 关键：版本按 exe 所在目录判断，而不是按当前工作目录。
-// CommonLibSSE 自带的 log_directory() 用 CWD 里的 steam_api64.dll 判断版本，
-// 在 MO2（StockGame 布局）等启动方式下 CWD 未必是游戏目录，会被误判成 GOG 版，
-// 结果日志写进了 "Skyrim Special Edition GOG" 文件夹，看起来就像"完全没有日志"。
+// 日志目录：<文档>\My Games\<版本>\SKSE（与 skse64.log 同目录）。
+// 版本按 exe 所在目录判断，而不是按当前工作目录 —— CommonLibSSE 的 log_directory()
+// 用 CWD 判断，在 MO2 等启动方式下可能误判成 GOG 版，导致日志"看起来不存在"。
 std::filesystem::path GetCanonicalLogDir()
 {
 	const auto ngDir = SKSE::log::log_directory();   // 只借用它解析出 <文档>\My Games
 	if (!ngDir) return {};
 
 	const auto myGames = ngDir->parent_path().parent_path();
-
 	std::wstring variant = L"Skyrim Special Edition";
 	if (const auto gameRoot = GetGameRoot()) {
 		std::error_code ec;
@@ -274,51 +135,113 @@ std::filesystem::path GetCanonicalLogDir()
 	return myGames / variant / L"SKSE";
 }
 
-// ------------------------------ 日志 ------------------------------
-// 统一写在 SKSE 插件的规范位置：<文档>\My Games\<版本>\SKSE\SummonNameFix.log
-// （与 skse64.log 同目录）。
-// 这里刻意放在 Load 的最开头：即使后续任何一步提前退出（例如地址库缺失），
-// 也一定留下可排查的记录。
+// ----------------------------------------------------------------------------------
+// 日志
+// ----------------------------------------------------------------------------------
 void SetupLog()
 {
 	const auto logsFolder = GetCanonicalLogDir();
-	if (logsFolder.empty()) {
-		return;   // 拿不到规范目录就不写日志，避免"东一个西一个"
-	}
+	if (logsFolder.empty()) return;   // 拿不到规范目录就不写日志，避免"东一个西一个"
 
 	std::error_code ec;
 	std::filesystem::create_directories(logsFolder, ec);
-
 	try {
 		const auto logFilePath = logsFolder / "SummonNameFix.log";
-		auto fileLogger = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
-		auto logger = std::make_shared<spdlog::logger>("global", std::move(fileLogger));
+		auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
+		auto logger = std::make_shared<spdlog::logger>("global", std::move(sink));
 		logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
 		logger->set_level(spdlog::level::info);
 		logger->flush_on(spdlog::level::info);
 		spdlog::set_default_logger(std::move(logger));
-		spdlog::info("日志文件：{}（游戏目录：{}）", logFilePath.string(),
-			GetGameRoot() ? GetGameRoot()->string() : std::string("(未知)"));
-	} catch (const std::exception& e) {
+	} catch (const std::exception&) {
 		// 日志不可写时静默继续：插件功能本身不依赖日志
-		(void)e;
 	}
 }
 
-// ------------------------------ 运行时特征扫描 ------------------------------
-// 在进程地址空间里扫描“真正的字符串字面量” a_needle。
-// 命中必须满足两个条件，避免误改：
-//   1) 起点：前一个字节是 NUL（上一串的结尾），或紧接 UTF-8 BOM（EF BB BF）；
-//   2) 终点：字面量以 NUL 结束。
-// 注意：这里刻意不做“往回找 lea”的校验 —— 引用字符串的 lea 指令位于代码段(.text)，
-// 而字符串位于数据段(.rdata)，两者在地址上并不相邻，往回扫永远不会命中。
-// v1 是用地址库 ID + 函数内偏移定位 lea 反解出同一个字符串，效果等价。
+// ----------------------------------------------------------------------------------
+// 配置：ini 与 dll 同目录；整份删除即用默认值
+// ----------------------------------------------------------------------------------
+void LoadConfig()
+{
+	auto iniPath = GetPluginPath();
+	iniPath.replace_extension(".ini");
+
+	std::ifstream file(iniPath);
+	if (!file.is_open()) {
+		spdlog::info("未找到配置文件 {}，使用默认语言 {}。", iniPath.string(), g_cfg.language);
+		return;
+	}
+
+	std::string line;
+	while (std::getline(file, line)) {
+		const auto comment = line.find_first_of(";#");
+		if (comment != std::string::npos) line.resize(comment);
+		const auto eq = line.find('=');
+		if (eq == std::string::npos) continue;
+
+		auto key = line.substr(0, eq);
+		auto val = line.substr(eq + 1);
+		const auto trim = [](std::string& s) {
+			const auto notSpace = [](char c) { return c != ' ' && c != '\t' && c != '\r' && c != '\n'; };
+			const auto b = std::find_if(s.begin(), s.end(), notSpace);
+			const auto e = std::find_if(s.rbegin(), s.rend(), notSpace).base();
+			s = (b < e) ? std::string(b, e) : std::string{};
+		};
+		trim(key);
+		trim(val);
+
+		if (key == "Language") {
+			g_cfg.language = val.empty() ? std::string{ kDefaultLanguage } : val;
+		} else if (key == "CustomAposReplacement") {
+			g_cfg.customApos = val;
+		}
+	}
+}
+
+// 解析语言：预设优先，CustomAposReplacement 可覆盖；随后由标记推导格式串。
+void ResolveLanguage()
+{
+	std::string_view marker;
+	for (const auto& [key, value] : kLanguagePresets) {
+		if (key == g_cfg.language) {
+			marker = value;
+			break;
+		}
+	}
+	if (marker.empty()) {
+		spdlog::warn("未知 Language=\"{}\"（可用：zh / ja / ko / de），回退到 {}。",
+			g_cfg.language, kDefaultLanguage);
+		for (const auto& [key, value] : kLanguagePresets) {
+			if (key == kDefaultLanguage) {
+				marker = value;
+				break;
+			}
+		}
+	}
+
+	if (!g_cfg.customApos.empty()) {
+		if (g_cfg.customApos.size() == patch_bytes::kMarkerBytes) {
+			marker = g_cfg.customApos;
+		} else {
+			spdlog::warn("CustomAposReplacement 必须是 {} 字节（当前 {} 字节），已忽略。",
+				patch_bytes::kMarkerBytes, g_cfg.customApos.size());
+		}
+	}
+
+	g_lang.apos.assign(marker);
+	g_lang.fmt = std::string("%s").append(g_lang.apos).append("%s");
+}
+
+// ----------------------------------------------------------------------------------
+// 字面量扫描：只扫主 exe 自身的映像（BaseOfImage .. BaseOfImage + SizeOfImage）
+// 命中要求：起点前一字节为 NUL（或紧接 UTF-8 BOM）、且以 NUL 结束 —— 即一个完整的 C 字符串字面量。
+// 说明：不做"从字符串往回找 lea"的校验 —— 引用字符串的 lea 位于 .text、字符串位于 .rdata，
+//       两者并不相邻，往回扫命中率恒为 0（这是早期方案的错误前提）。
+// ----------------------------------------------------------------------------------
 std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 {
 	if (a_needle.empty()) return {};
 
-	// 只扫主 exe 自身的映像范围（BaseOfImage .. BaseOfImage + SizeOfImage）。
-	// 好处：1) 耗时从秒级降到毫秒级；2) 绝不触碰其它模块/插件的内存。
 	const HMODULE mod = ::GetModuleHandleA(nullptr);
 	if (!mod) return {};
 
@@ -332,7 +255,6 @@ std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 	const auto imageEnd = base + static_cast<std::uintptr_t>(ntHeaders->OptionalHeader.SizeOfImage);
 
 	std::vector<std::uintptr_t> result;
-
 	for (auto cur = base; cur < imageEnd;) {
 		MEMORY_BASIC_INFORMATION mbi{};
 		if (!::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi))) break;
@@ -350,9 +272,7 @@ std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 				for (std::size_t i = 0; i + a_needle.size() < len; ++i) {
 					if (region[i] != firstByte) continue;   // 首字节快速过滤
 					if (std::memcmp(region + i, a_needle.data(), a_needle.size()) != 0) continue;
-					// 终点：必须是完整的字面量（后面紧跟 NUL）
-					if (region[i + a_needle.size()] != 0) continue;
-					// 起点：前一字节为 NUL，或紧接 UTF-8 BOM（带 BOM 的 exe 变体）
+					if (region[i + a_needle.size()] != 0) continue;   // 必须是完整字面量（尾随 NUL）
 					const bool atLiteralStart =
 						(cur + i == base) ||
 						(i > 0 && (region[i - 1] == 0 ||
@@ -368,53 +288,38 @@ std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 	return result;
 }
 
-// 早期“从字符串往回找 lea”方案（DecodeLeaOffset / ResolveFmtAddrFromCandidate）已整体删除：
-// 它基于“引用字符串的 lea 紧邻该字符串”这一错误前提（lea 在 .text、字符串在 .rdata，两者不相邻），
-// 命中率恒为 0，已由下方“按完整字面量精确定位”取代。
-
-
-// 主流程：按“完整字面量”精确定位并等长覆写。
-//
-// 依据（对你机器上 SkyrimSE.exe 的实际字节取证）：
-//   "%s's %s" + NUL 全 exe 仅 1 处（文件偏移 0x159F438 ⇒ RVA 0x15A0638）
-//   "'s "     + NUL 全 exe 仅 1 处（文件偏移 0x1558C84 ⇒ RVA 0x1559E84）
-// 这两个地址正是 v1 成功补丁过的位置，且两处的前一字节都是 0x00（标准字符串字面量起点）。
-// 所以只需要“原串唯一匹配 + 首尾边界校验”，不需要 Address Library、不需要函数内偏移、
-// 不需要任何按版本写死的地址，也不存在误伤的可能。
-bool ApplyStringPatch(
-	std::string_view a_expected,
-	std::string_view a_replacement,
-	std::string_view a_label)
+// ----------------------------------------------------------------------------------
+// 等长替换
+// ----------------------------------------------------------------------------------
+bool ApplyStringPatch(std::string_view a_expected, std::string_view a_replacement, std::string_view a_label)
 {
 	if (a_expected.size() != a_replacement.size()) {
-		spdlog::error("[{}] 内部错误：替换串（{}）与原文长度（{}）不一致，放弃。",
+		spdlog::error("[{}] 内部错误：替换串（{} 字节）与原文（{} 字节）长度不一致，放弃。",
 			a_label, a_replacement.size(), a_expected.size());
 		return false;
 	}
 
-	// FindStringRVA 只返回“完整字符串字面量”的地址：
-	// 起点前一字节为 NUL（或紧接 UTF-8 BOM），且以 NUL 结束。
 	const auto targets = FindStringRVA(a_expected);
 	if (targets.empty()) {
-		spdlog::error("[{}] 未在进程地址空间找到字面量 \"{}\"，本补丁跳过。", a_label, a_expected);
+		spdlog::error("[{}] 未在 exe 映像内找到字面量 \"{}\"，本补丁跳过。", a_label, a_expected);
 		return false;
 	}
-	spdlog::info("[{}] 字面量定位成功：\"{}\" 共 {} 处。", a_label, a_expected, targets.size());
 
 	std::size_t patched = 0;
-	for (const auto fmtAddr : targets) {
+	for (const auto addr : targets) {
 		DWORD oldProtect = 0;
-		if (!::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), PAGE_READWRITE, &oldProtect)) {
-			spdlog::error("[{}] VirtualProtect 失败（0x{:X}，GetLastError={}），跳过该处。", a_label, fmtAddr, ::GetLastError());
+		if (!::VirtualProtect(reinterpret_cast<LPVOID>(addr), a_replacement.size(), PAGE_READWRITE, &oldProtect)) {
+			spdlog::error("[{}] VirtualProtect 失败（0x{:X}，GetLastError={}），跳过该处。",
+				a_label, addr, ::GetLastError());
 			continue;
 		}
-		std::memcpy(reinterpret_cast<void*>(fmtAddr), a_replacement.data(), a_replacement.size());
+		std::memcpy(reinterpret_cast<void*>(addr), a_replacement.data(), a_replacement.size());
 		DWORD tmp = 0;
-		::VirtualProtect(reinterpret_cast<LPVOID>(fmtAddr), a_replacement.size(), oldProtect, &tmp);
-		::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(fmtAddr), a_replacement.size());
+		::VirtualProtect(reinterpret_cast<LPVOID>(addr), a_replacement.size(), oldProtect, &tmp);
+		::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), a_replacement.size());
 
 		spdlog::info("[{}] 已补丁：0x{:X}：\"{}\" -> \"{}\"（等长 {} 字节）。",
-			a_label, fmtAddr, a_expected, std::string(a_replacement), a_replacement.size());
+			a_label, addr, a_expected, a_replacement, a_replacement.size());
 		++patched;
 	}
 
@@ -426,177 +331,8 @@ bool ApplyStringPatch(
 	return true;
 }
 
-// ------------------------------ 兜底 hook ------------------------------
-const char* (*g_origGetDisplayFullName)(RE::TESObjectREFR*) = nullptr;
-
-std::mutex g_cacheLock;
-std::unordered_map<std::string, std::string> g_cache;
-std::size_t g_logCount = 0;
-
-const char* FixName(const char* a_name)
-{
-	if (!a_name) return a_name;
-	if (!std::strstr(a_name, patch_bytes::kNeedleC)) return a_name;
-
-	std::lock_guard<std::mutex> lk(g_cacheLock);
-	if (g_cache.size() < g_cfg.cacheLimit) {
-		auto [it, inserted] = g_cache.try_emplace(a_name);
-		if (inserted) {
-			std::string s = a_name;
-			const auto pos = s.find(patch_bytes::kNeedle);
-			if (pos != std::string::npos) {
-				s.replace(pos, patch_bytes::kNeedle.size(), g_lang.aposReplacement);
-			}
-			it->second = std::move(s);
-		}
-		return it->second.c_str();
-	}
-
-	thread_local std::string buf;
-	buf = a_name;
-	const auto pos = buf.find(patch_bytes::kNeedle);
-	if (pos != std::string::npos) {
-		buf.replace(pos, patch_bytes::kNeedle.size(), g_lang.aposReplacement);
-	}
-	return buf.c_str();
-}
-
-const char* HookedGetDisplayFullName(RE::TESObjectREFR* a_this)
-{
-	const char* name = g_origGetDisplayFullName(a_this);
-
-	if (g_cfg.logNameCalls && name && g_logCount < g_cfg.logCallsLimit) {
-		g_logCount++;
-		char snap[256]{};
-		strncpy_s(snap, sizeof(snap), name, _TRUNCATE);
-		spdlog::info(
-			"[调查#{}] this={:016X} ret={:016X} thread={:04X} isActor={} len={} str=\"{}\" hex={}",
-			g_logCount,
-			reinterpret_cast<std::uintptr_t>(a_this),
-			reinterpret_cast<std::uintptr_t>(_ReturnAddress()),
-			::GetCurrentThreadId(),
-			a_this ? a_this->GetFormType() == RE::FormType::ActorCharacter : false,
-			std::strlen(snap),
-			snap,
-			[&snap] {
-				std::string hex;
-				const auto l = std::strlen(snap);
-				hex.reserve(l * 3);
-				char tmp[8]{};
-				for (std::size_t i = 0; i < l; ++i) {
-					std::format_to_n(tmp, sizeof(tmp), "{:02x} ", static_cast<std::uint8_t>(snap[i]));
-					hex += tmp;
-				}
-				return hex;
-			}());
-	}
-
-	if (!g_cfg.hookDisplayName) return name;
-	if (g_cfg.hookOnlyActors && a_this && a_this->GetFormType() != RE::FormType::ActorCharacter) return name;
-	return FixName(name);
-}
-
-bool WriteRel32Jump(std::uintptr_t a_src, std::uintptr_t a_dst)
-{
-	const auto delta = static_cast<std::ptrdiff_t>(a_dst) - static_cast<std::ptrdiff_t>(a_src + 5);
-	if (delta < std::numeric_limits<std::int32_t>::min() || delta > std::numeric_limits<std::int32_t>::max()) {
-		spdlog::error("相对跳转超范围（0x{:X} -> 0x{:X}），放弃。", a_src, a_dst);
-		return false;
-	}
-
-	std::uint8_t code[5] = { 0xE9 };
-	const auto disp = static_cast<std::int32_t>(delta);
-	std::memcpy(code + 1, &disp, sizeof(disp));
-
-	DWORD oldProtect = 0;
-	if (!::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-		spdlog::error("VirtualProtect 失败（0x{:X}，GetLastError={}），放弃。", a_src, ::GetLastError());
-		return false;
-	}
-	std::memcpy(reinterpret_cast<void*>(a_src), code, sizeof(code));
-	DWORD tmp = 0;
-	::VirtualProtect(reinterpret_cast<LPVOID>(a_src), sizeof(code), oldProtect, &tmp);
-	::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(a_src), sizeof(code));
-	return true;
-}
-
-void* AllocateExecNear(std::uintptr_t a_target, std::size_t a_size)
-{
-	SYSTEM_INFO si{};
-	::GetSystemInfo(&si);
-	const auto gran = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
-	constexpr std::uintptr_t kReach = 0x7FFF0000ull;
-	const auto low = (a_target > kReach) ? (a_target - kReach) : gran;
-	const auto high = a_target + kReach;
-	const auto start = a_target & ~(gran - 1);
-
-	for (auto addr = start; addr > low; addr -= gran) {
-		if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
-			return p;
-		}
-	}
-	for (auto addr = start + gran; addr < high; addr += gran) {
-		if (auto* p = ::VirtualAlloc(reinterpret_cast<LPVOID>(addr), a_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
-			return p;
-		}
-	}
-	return nullptr;
-}
-
-namespace ids
-{
-	// GetDisplayFullName 的 Address Library ID（SE / AE）。VR 由 VR 地址库解析 SE 号。
-	constexpr std::uint32_t kGetDisplayFullName = 19354;
-	constexpr std::uint32_t kAe_GetDisplayFullName = 19781;
-
-	// （原先的 24212 / 17486 地址库 ID 与函数内固定偏移已移除：
-	//   两个核心补丁改为按字符串字面量精确定位，不再依赖地址库。）
-}
-
-bool InstallHook()
-{
-	REL::Relocation<std::uintptr_t> func{ RELOCATION_ID(ids::kGetDisplayFullName, ids::kAe_GetDisplayFullName) };
-	const auto addr = func.address();
-	if (addr == 0) {
-		spdlog::error("GetDisplayFullName 地址解析失败（ID {}），跳过兜底 hook。", ids::kGetDisplayFullName);
-		return false;
-	}
-
-	static constexpr std::array<std::uint8_t, 5> kPrologue{ 0x40, 0x53, 0x55, 0x56, 0x57 };
-	if (std::memcmp(reinterpret_cast<const void*>(addr), kPrologue.data(), kPrologue.size()) != 0) {
-		spdlog::error("GetDisplayFullName（0x{:X}）函数头与预期不符（已被其它插件 hook 或版本漂移），跳过兜底 hook。", addr);
-		return false;
-	}
-
-	auto* stub = static_cast<std::uint8_t*>(AllocateExecNear(addr, 32));
-	if (!stub) {
-		spdlog::error("无法在 GetDisplayFullName 附近分配跳板内存，跳过兜底 hook。");
-		return false;
-	}
-	std::memcpy(stub, reinterpret_cast<const void*>(addr), kPrologue.size());
-	if (!WriteRel32Jump(reinterpret_cast<std::uintptr_t>(stub) + kPrologue.size(), addr + kPrologue.size())) {
-		::VirtualFree(stub, 0, MEM_RELEASE);
-		spdlog::error("跳板回跳写入失败，跳过兜底 hook。");
-		return false;
-	}
-
-	g_origGetDisplayFullName = reinterpret_cast<decltype(g_origGetDisplayFullName)>(stub);
-	if (!WriteRel32Jump(addr, reinterpret_cast<std::uintptr_t>(&HookedGetDisplayFullName))) {
-		g_origGetDisplayFullName = nullptr;
-		::VirtualFree(stub, 0, MEM_RELEASE);
-		spdlog::error("GetDisplayFullName 首页改写失败，跳过兜底 hook。");
-		return false;
-	}
-
-	spdlog::info("兜底 hook 已安装：目标 0x{:X}，跳板 0x{:X}（仅 Actor={}）。",
-		addr, reinterpret_cast<std::uintptr_t>(stub), g_cfg.hookOnlyActors);
-	return true;
-}
-
 // ----------------------------------------------------------------------------------
-// SKSE 入口：与 Zzyxz 模板保持一致——AE 读取 SKSEPlugin_Version，SE / VR 走 SKSEPlugin_Query。
-// 不锁死具体版本号；格式串差异由运行时特征扫描 + 双重校验消化，任何一步失败只记日志并跳过。
-// 运行期需要 Address Library（SKSEPlugin_Load 在 Init 前检查，缺失则插件不生效）。
+// SKSE 入口：AE 读 SKSEPlugin_Version，SE / VR 走 SKSEPlugin_Query
 // ----------------------------------------------------------------------------------
 namespace
 {
@@ -624,7 +360,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Query(const SKSE::Query
 	if (a_skse->IsEditor()) {
 		return false;
 	}
-	// SKSE VR 报告的是 1.4.15.1，所以这里只按运行时族判断，具体地址库文件在 Load 里再选。
+	// SKSE VR 报告的是 1.4.15.1，所以只按运行时族判断
 	[[maybe_unused]] const auto family = REL::Module::RuntimeFor(a_skse->RuntimeVersion());
 #ifdef ENABLE_SKYRIM_SE
 	if (family == REL::Module::Runtime::SE) {
@@ -641,8 +377,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Query(const SKSE::Query
 
 extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
 {
-	// 第一件事就是建立日志：这样即使后面任何一步提前退出，也一定留下可排查的记录。
-	g_cfg.logLevel = spdlog::level::info;
+	// 第一步就建日志：即使后面任何一步提前退出，也一定留下可排查的记录。
 	SetupLog();
 
 	const auto runtime = a_skse->RuntimeVersion();
@@ -651,54 +386,17 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 	spdlog::info("已加载模块：{}", GetPluginPath().string());
 	spdlog::info("运行时 {}。", runtime.string());
 
-	// 执行顺序说明：下面两个字符串补丁是纯 Win32 操作，不需要 SKSE::Init，也不需要地址库。
-	// 所以采用“先补丁、后 Init”：即使没装 Address Library 也能正常汉化，
-	// 也避免“缺地址库时 Init 会终止游戏”牵连到主功能。
 	LoadConfig();
 	ResolveLanguage();
-	spdlog::set_level(g_cfg.logLevel);
+	spdlog::info("语言：{}（格式串 \"{}\" → \"{}\"，所有格 \"{}\" → \"{}\"）。",
+		g_cfg.language, patch_bytes::kFmtExpected, g_lang.fmt,
+		patch_bytes::kAposExpected, g_lang.apos);
 
-	if (!g_cfg.master) {
-		spdlog::warn("ini 配置 Enable=false，插件不做任何修改，直接退出。");
-		return true;
-	}
+	// 补丁 1：召唤物 / 有主 Actor 的名字组装（printf 式复合格式串）
+	ApplyStringPatch(patch_bytes::kFmtExpected, g_lang.fmt, "召唤物路径");
 
-	spdlog::info("语言包：{}（格式串 \"{}\" → \"{}\"）。",
-		g_cfg.language, patch_bytes::kFmtExpected, g_lang.fmtReplacement);
-
-	// 补丁 1：召唤物/有主 Actor 路径（格式串 "%s's %s" → 目标语言等长替换）
-	if (g_cfg.patchSummon) {
-		ApplyStringPatch(
-			patch_bytes::kFmtExpected,
-			g_lang.fmtReplacement,
-			g_lang.formatName);
-	}
-
-	// 补丁 2：有主容器路径（格式串 "'s " → 目标语言等长替换）
-	if (g_cfg.patchContainer) {
-		ApplyStringPatch(
-			patch_bytes::kAposExpected,
-			g_lang.aposReplacement,
-			g_lang.aposName);
-	}
-
-	// 两个核心补丁已完成。接下来：地址库就绪时才 Init（缺地址库时 Init 会终止游戏），
-	// Init 只影响下面可选的兜底 hook。
-	const bool hasAddressLibrary = !REL::Module::FindAddressLibrary().empty();
-	spdlog::info("Address Library：{}。",
-		hasAddressLibrary ? "已找到" : "缺失（只影响可选的 GetDisplayFullName hook）");
-	if (hasAddressLibrary) {
-		SKSE::Init(a_skse);
-	}
-
-	// 兜底 hook：GetDisplayFullName（ID 19354/19781）走 REL::Relocation，必须有地址库。
-	if (g_cfg.hookDisplayName || g_cfg.logNameCalls) {
-		if (hasAddressLibrary) {
-			InstallHook();
-		} else {
-			spdlog::warn("Address Library 缺失，跳过 GetDisplayFullName 兜底 hook。");
-		}
-	}
+	// 补丁 2：有主容器的名字组装（独立所有格串，strcat 拼接）
+	ApplyStringPatch(patch_bytes::kAposExpected, g_lang.apos, "有主容器路径");
 
 	spdlog::info("SummonNameFix 初始化完成。");
 	return true;
