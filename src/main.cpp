@@ -439,9 +439,74 @@ std::uintptr_t ResolveFmtAddrFromCandidate(
 	return 0;
 }
 
-// 主流程：扫描 + 验证 + 写入补丁
+// 当前是否 SE（含 1.5.x）。下面按地址库 ID 精确定位只在 SE 上做——
+// 因为我们手上只有 SE 的 ID（v1 验证过），AE 的 ID 未经验证，绝不猜。
+bool IsSkyrimSE()
+{
+	return REL::Module::RuntimeFor(REL::Module::get().version()) == REL::Module::Runtime::SE;
+}
+
+// 用地址库 ID 解析目标函数入口地址；解析不到返回 0。
+std::uintptr_t ResolveFunction(std::uint32_t a_seID)
+{
+	try {
+		REL::Relocation<std::uintptr_t> fn{ RELOCATION_ID(a_seID, 0) };
+		return fn.address();
+	} catch (...) {
+		return 0;
+	}
+}
+
+// 在目标函数体内（起始 a_funcAddr，最多扫 a_window 字节）寻找那条引用指定字面量的
+// rip 相对 lea，并反解出字面量地址 —— 等价于 v1 的做法，但把“函数内固定偏移”
+// 换成了结构搜索，因此不受编译器/版本导致的指令位移变化影响。
+// 命中条件很严：lea 反解出的地址处，内容必须与该字面量逐字节相同（含尾随 NUL）。
+std::uintptr_t FindLiteralInFunction(std::uintptr_t a_funcAddr, std::size_t a_window, std::string_view a_expected)
+{
+	if (a_funcAddr == 0 || a_expected.empty()) return 0;
+
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!::VirtualQuery(reinterpret_cast<LPCVOID>(a_funcAddr), &mbi, sizeof(mbi))) return 0;
+	if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0) {
+		return 0;
+	}
+
+	const auto regionEnd = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+	const auto limit = (a_funcAddr + a_window < regionEnd) ? (a_funcAddr + a_window) : regionEnd;
+	const auto* code = reinterpret_cast<const std::uint8_t*>(a_funcAddr);
+
+	for (auto addr = a_funcAddr; addr + 7 <= limit; ++addr) {
+		const auto i = static_cast<std::size_t>(addr - a_funcAddr);
+		const auto rex = code[i];
+		if (rex != 0x48 && rex != 0x4C) continue;      // REX.W（48）/ REX.WR（4C）
+		if (code[i + 1] != 0x8D) continue;             // lea
+		if ((code[i + 2] & 0xC7) != 0x05) continue;    // mod=00, rm=101 → RIP 相对
+
+		const auto disp = *reinterpret_cast<const std::int32_t*>(code + i + 3);
+		const auto target = static_cast<std::uintptr_t>(
+			static_cast<std::int64_t>(addr) + 7 + static_cast<std::int64_t>(disp));
+
+		MEMORY_BASIC_INFORMATION tmbi{};
+		if (!::VirtualQuery(reinterpret_cast<LPCVOID>(target), &tmbi, sizeof(tmbi))) continue;
+		if (tmbi.State != MEM_COMMIT ||
+			(tmbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ)) == 0) {
+			continue;
+		}
+		const auto targetEnd = reinterpret_cast<std::uintptr_t>(tmbi.BaseAddress) + tmbi.RegionSize;
+		if (target + a_expected.size() >= targetEnd) continue;
+
+		const auto* p = reinterpret_cast<const std::uint8_t*>(target);
+		if (std::memcmp(p, a_expected.data(), a_expected.size()) == 0 && p[a_expected.size()] == 0) {
+			return target;
+		}
+	}
+	return 0;
+}
+
+// 主流程：优先用地址库 ID 精确定位目标函数，再在函数体内按结构反解出格式串；
+// 地址库不可用（或非 SE）时回退到全进程字面量搜索。写入前一律做逐字节校验。
 bool ApplyStringPatch(
-	std::string_view a_needle,
+	std::uint32_t a_seFuncID,
 	std::string_view a_expected,
 	std::string_view a_replacement,
 	std::string_view a_label)
@@ -452,19 +517,39 @@ bool ApplyStringPatch(
 		return false;
 	}
 
-	const auto candidates = FindStringRVA(a_needle);
-	if (candidates.empty()) {
-		spdlog::error("[{}] 未在进程地址空间找到字符串字面量 \"{}\"（{} 字节），本补丁跳过。",
-			a_label, a_needle, a_needle.size());
-		return false;
+	// 第一步（精准）：地址库 ID → 目标函数入口 → 函数体内反解 lea → 格式串地址。
+	std::vector<std::uintptr_t> targets;
+	if (a_seFuncID != 0 && IsSkyrimSE()) {
+		if (const auto funcAddr = ResolveFunction(a_seFuncID)) {
+			const auto literal = FindLiteralInFunction(funcAddr, 0x800, a_expected);
+			if (literal != 0) {
+				spdlog::info("[{}] 地址库 ID {} → 函数 0x{:X}，函数体内反解出格式串 0x{:X}。",
+					a_label, a_seFuncID, funcAddr, literal);
+				targets.push_back(literal);
+			} else {
+				spdlog::warn("[{}] 地址库 ID {} → 函数 0x{:X}，但函数体内未找到引用该格式串的 lea，改用字面量搜索。",
+					a_label, a_seFuncID, funcAddr);
+			}
+		} else {
+			spdlog::warn("[{}] 地址库 ID {} 无法解析（未安装地址库或该版本无此 ID），改用字面量搜索。",
+				a_label, a_seFuncID);
+		}
+	} else if (a_seFuncID != 0) {
+		spdlog::info("[{}] 非 SE 运行时（未验证过对应 ID），直接用字面量搜索。", a_label);
 	}
 
-	// FindStringRVA 已经完成“完整字面量”校验（起点边界 + 尾随 NUL），直接写入即可。
-	// 不再做“往回找 lea”：引用该字符串的 lea 在 .text，字符串在 .rdata，两者不相邻，
-	// 往回扫命中率为 0（v1 是靠地址库 ID + 函数内偏移定位 lea，效果等价）。
-	const auto& targets = candidates;
-	spdlog::info("[{}] 找到 {} 处字符串字面量 \"{}\"（{} 字节），开始等长替换。",
-		a_label, targets.size(), a_expected, a_expected.size());
+	// 第二步（兜底 / 多版本通用）：全进程按“完整字面量”搜索。
+	if (targets.empty()) {
+		targets = FindStringRVA(a_expected);
+		if (!targets.empty()) {
+			spdlog::warn("[{}] 字面量搜索命中 {} 处。", a_label, targets.size());
+		}
+	}
+
+	if (targets.empty()) {
+		spdlog::error("[{}] 既无法经地址库定位，也没找到字面量 \"{}\"，本补丁跳过。", a_label, a_expected);
+		return false;
+	}
 
 	std::size_t patched = 0;
 	for (const auto fmtAddr : targets) {
@@ -613,6 +698,14 @@ namespace ids
 	// GetDisplayFullName 的 Address Library ID（SE / AE）。VR 由 VR 地址库解析 SE 号。
 	constexpr std::uint32_t kGetDisplayFullName = 19354;
 	constexpr std::uint32_t kAe_GetDisplayFullName = 19781;
+
+	// 下面两个是 v1 在 SE 1.5.97 上验证过的地址库 ID（目标函数入口，
+	// 即 TESNPC / TESObjectCONT 的 vtable 槽 76 —— 名字组装函数）。
+	//   kFmtExpected  "%s's %s" 由 24212 所在函数引用
+	//   kAposExpected "'s "     由 17486 所在函数引用
+	// 注意：AE 对应 ID 未经验证，因此 AE/VR 不走 ID 路径，直接用字面量搜索。
+	constexpr std::uint32_t kNpcNameBuilder = 24212;
+	constexpr std::uint32_t kContNameBuilder = 17486;
 }
 
 bool InstallHook()
@@ -731,19 +824,19 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 		g_cfg.language, patch_bytes::kFmtExpected, g_lang.fmtReplacement);
 
 	// 补丁 1：召唤物/有主 Actor 路径（格式串 "%s's %s" → 目标语言等长替换）
-	// 核心补丁是纯 Win32 内存扫描 + 等长替换，不依赖 Address Library。
+	// 先按地址库 ID 24212 精确定位到名字组装函数，再在函数体内反解出格式串；失败则回退字面量搜索。
 	if (g_cfg.patchSummon) {
 		ApplyStringPatch(
-			patch_bytes::kFmtExpected,
+			ids::kNpcNameBuilder,
 			patch_bytes::kFmtExpected,
 			g_lang.fmtReplacement,
 			g_lang.formatName);
 	}
 
-	// 补丁 2：有主容器路径（格式串 "'s " → 目标语言等长替换）
+	// 补丁 2：有主容器路径（格式串 "'s " → 目标语言等长替换），地址库 ID 17486。
 	if (g_cfg.patchContainer) {
 		ApplyStringPatch(
-			patch_bytes::kAposExpected,
+			ids::kContNameBuilder,
 			patch_bytes::kAposExpected,
 			g_lang.aposReplacement,
 			g_lang.aposName);
