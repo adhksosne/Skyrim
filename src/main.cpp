@@ -39,7 +39,6 @@
 #include <iterator>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -57,25 +56,13 @@
 // ----------------------------------------------------------------------------------
 namespace patch_bytes
 {
-	// 英文原串（两个路径）——作为特征匹配的种子，全 exe 均仅 1 处引用
+	// 英文原串（两个路径）——作为特征匹配的种子，实测在 exe 中均仅 1 处
 	constexpr std::string_view kFmtExpected{ "%s's %s", 7 };
 	constexpr std::string_view kAposExpected{ "'s ", 3 };
-
-	// 搜索模式（同时覆盖带/不带 UTF-8 BOM 两种 exe 变体；不含 BOM 的 exe 也能匹配，因为子串本身无冲突）
-	// UTF-8 BOM = EF BB BF，共 3 字节；BOM 之后的第一个字节是 '%' (0x25)，所以 pattern 为 BOM + '%'
-	constexpr std::array<std::uint8_t, 4> kBomFirstByte = { 0xEF, 0xBB, 0xBF, 0x25 };
-	constexpr std::array<std::uint8_t, 1>   kFmtSeeds = { 0x25 };     // '%'
-	constexpr std::array<std::uint8_t, 3>   kAposSeeds = { 0x27, 0x73, 0x20 }; // ''' 's' ' '
 
 	// strstr 快速针（含尾随空格；拼接处必为 "'s "）
 	constexpr std::string_view kNeedle{ "'s ", 3 };
 	constexpr const char* kNeedleC = "'s ";
-
-	// 用于反解 lea 的 3 字节 opcode 候选（48 8D xx 是 x64 标准前缀；4C 8D 05 是 lea r8）
-	constexpr std::array<std::uint8_t, 3> kLeaPrefix = { 0x48, 0x8D };
-
-	// 回看 lea 指令的最大字节范围（lea 通常紧邻格式串，但不同编译产物/优化级别会有出入）
-	constexpr std::size_t kMaxBackScan = 64;
 }
 
 // 语言包默认值（中文）
@@ -330,120 +317,61 @@ std::vector<std::uintptr_t> FindStringRVA(std::string_view a_needle)
 {
 	if (a_needle.empty()) return {};
 
+	// 只扫主 exe 自身的映像范围（BaseOfImage .. BaseOfImage + SizeOfImage）。
+	// 好处：1) 耗时从秒级降到毫秒级；2) 绝不触碰其它模块/插件的内存。
 	const HMODULE mod = ::GetModuleHandleA(nullptr);
 	if (!mod) return {};
 
-	MEMORY_BASIC_INFORMATION mbi{};
-	std::vector<std::uintptr_t> result;
-	auto cur = reinterpret_cast<std::uintptr_t>(mod);
+	const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
+	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return {};
+	const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+		reinterpret_cast<const std::uint8_t*>(mod) + dosHeader->e_lfanew);
+	if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return {};
 
-	while (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) &&
-		   mbi.BaseAddress == reinterpret_cast<LPVOID>(cur)) {
-		// 同时覆盖 PAGE_READONLY(.rdata) / PAGE_READWRITE / PAGE_EXECUTE_READ
-		if (mbi.State == MEM_COMMIT &&
+	const auto base = reinterpret_cast<std::uintptr_t>(mod);
+	const auto imageEnd = base + static_cast<std::uintptr_t>(ntHeaders->OptionalHeader.SizeOfImage);
+
+	std::vector<std::uintptr_t> result;
+
+	for (auto cur = base; cur < imageEnd;) {
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (!::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi))) break;
+
+		const auto regionEnd = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+		const auto scanEnd = (regionEnd < imageEnd) ? regionEnd : imageEnd;
+
+		if (mbi.State == MEM_COMMIT && scanEnd > cur &&
 			(mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ)) != 0) {
 			const auto* region = reinterpret_cast<const std::uint8_t*>(cur);
-			const auto len = static_cast<std::size_t>(mbi.RegionSize);
+			const auto len = static_cast<std::size_t>(scanEnd - cur);
 
 			if (len > a_needle.size()) {
+				const auto firstByte = a_needle.front();
 				for (std::size_t i = 0; i + a_needle.size() < len; ++i) {
-					if (std::memcmp(region + i, a_needle.data(), a_needle.size()) != 0) {
-						continue;
-					}
+					if (region[i] != firstByte) continue;   // 首字节快速过滤
+					if (std::memcmp(region + i, a_needle.data(), a_needle.size()) != 0) continue;
 					// 终点：必须是完整的字面量（后面紧跟 NUL）
-					if (region[i + a_needle.size()] != 0) {
-						continue;
-					}
-					// 起点：前一字节为 NUL，或紧接 UTF-8 BOM（可能带 BOM 的 exe 变体）
+					if (region[i + a_needle.size()] != 0) continue;
+					// 起点：前一字节为 NUL，或紧接 UTF-8 BOM（带 BOM 的 exe 变体）
 					const bool atLiteralStart =
-						(i == 0) || (region[i - 1] == 0) ||
-						(i >= 3 && region[i - 1] == 0xBF && region[i - 2] == 0xBB && region[i - 3] == 0xEF);
+						(cur + i == base) ||
+						(i > 0 && (region[i - 1] == 0 ||
+							(i >= 3 && region[i - 1] == 0xBF && region[i - 2] == 0xBB && region[i - 3] == 0xEF)));
 					if (atLiteralStart) {
 						result.push_back(cur + i);
 					}
 				}
 			}
 		}
-		cur += mbi.RegionSize;
+		cur = (scanEnd > cur) ? scanEnd : (cur + 0x1000);   // 兜底推进，避免死循环
 	}
 	return result;
 }
 
-// 解析 lea reg,[rip+disp32] 中 disp32，返回格式串的 RVA。
-// a_addr 是指令起始地址，a_leaOpcode 是 3 字节前缀（如 48 8D xx）。
-// 若解析失败返回 0。
-std::uintptr_t DecodeLeaOffset(std::uintptr_t a_addr, std::span<const std::uint8_t> a_leaOpcode)
-{
-	if (a_leaOpcode.size() > 3) return 0;
-	if (a_addr < reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr)) + a_leaOpcode.size()) return 0;
+// 早期“从字符串往回找 lea”方案（DecodeLeaOffset / ResolveFmtAddrFromCandidate）已整体删除：
+// 它基于“引用字符串的 lea 紧邻该字符串”这一错误前提（lea 在 .text、字符串在 .rdata，两者不相邻），
+// 命中率恒为 0，已由下方“按完整字面量精确定位”取代。
 
-	const auto* insn = reinterpret_cast<const std::uint8_t*>(a_addr);
-	if (std::memcmp(reinterpret_cast<const void*>(a_addr), a_leaOpcode.data(), a_leaOpcode.size()) != 0) {
-		return 0;
-	}
-
-	// 48 8D xx 5byte 指令：前缀 + opcode + ModRM + disp32
-	// 此处固定假设 48 8D xx 后面紧跟 disp32（标准 lea r/m64,[rip+disp32]）
-	const auto disp = *reinterpret_cast<const std::int32_t*>(insn + a_leaOpcode.size());
-	const auto instrEnd = a_addr + a_leaOpcode.size() + 4;
-
-	// 安全检查：rip+disp 不应回退到模块基址以下（排除无效地址）
-	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-	if (instrEnd + static_cast<std::uint32_t>(disp) < baseAddr) return 0;
-	if (instrEnd + static_cast<std::uint32_t>(disp) > baseAddr + 0x7FFFFFFFULL) return 0;
-
-	return instrEnd + static_cast<std::uint32_t>(disp);
-}
-
-// 从候选 RVA 向回扫描若干字节，寻找能正确反解出 a_candidate 的 lea 指令。
-// 失败返回 0。
-std::uintptr_t ResolveFmtAddrFromCandidate(
-	std::uintptr_t a_candidate,
-	std::span<const std::uint8_t> a_leaOpcode,
-	std::string_view a_expected,
-	std::string_view a_label)
-{
-	if (a_candidate == 0) return 0;
-
-	// 快速前置校验：候选地址处的内容必须完全等于预期原串（含 NUL 结尾）
-	const auto* cur = reinterpret_cast<const std::uint8_t*>(a_candidate);
-	if (std::memcmp(cur, a_expected.data(), a_expected.size()) != 0 ||
-		cur[a_expected.size()] != 0) {
-		return 0;  // 候选不是真正的格式串（可能命中了其他位置的相同字节序列）
-	}
-
-	// 向回扫描 lea 指令：实际上此函数已被主循环内联替代，保留以防复用
-	(void)a_leaOpcode;
-	(void)a_label;
-
-	// 向回扫描 lea 指令
-	const auto baseAddr = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-	const auto scanStart = a_candidate > patch_bytes::kMaxBackScan
-		? (a_candidate - patch_bytes::kMaxBackScan)
-		: baseAddr;
-
-	for (auto addr = a_candidate - 1; addr >= scanStart; --addr) {
-		// 只扫描 48 8D 开头的指令（lea r/m64, rel/m offset）
-		if (addr + 2 > a_candidate) break;
-		const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
-		if (p[0] == 0x48 && p[1] == 0x8D) {
-			// 尝试用不同的 ModRM 字节（xx）解析
-			for (int rm = 0; rm < 8; ++rm) {
-				const std::array<std::uint8_t, 3> candidate = { 0x48, 0x8D, static_cast<std::uint8_t>(0x05 + rm * 0) };
-				// 实际上 modrm 决定 reg/rm，但 lea 总是 48 8D xx；这里只校验前缀后紧跟 disp32
-				// 简化处理：直接尝试从 addr 开始解析整个 7 字节指令
-				const auto resolved = DecodeLeaOffset(addr, std::span<const std::uint8_t>(p, 3));
-				if (resolved == a_candidate) {
-					spdlog::info("[{}] lea 反解成功：addr=0x{:X} → fmt=0x{:X}", a_label, addr, resolved);
-					return a_candidate;
-				}
-			}
-		}
-	}
-
-	spdlog::warn("[{}] 未能在候选 0x{:X} 附近找到匹配的 lea 指令，放弃。", a_label, a_candidate);
-	return 0;
-}
 
 // 主流程：按“完整字面量”精确定位并等长覆写。
 //
@@ -723,16 +651,9 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 	spdlog::info("已加载模块：{}", GetPluginPath().string());
 	spdlog::info("运行时 {}。", runtime.string());
 
-	// 与 v1 保持一致：无条件 SKSE::Init。
-	// 关键点：地址库的 ID 数据库是在 SKSE::Init 里装载的；不调用 Init，
-	// REL::Relocation{ RELOCATION_ID(24212, 0) } 一律解析失败，
-	// v1 那条“ID + 函数内偏移”的精准路径就会整条失效（这正是之前不生效的直接原因之一）。
-	SKSE::Init(a_skse);
-
-	const bool hasAddressLibrary = !REL::Module::FindAddressLibrary().empty();
-	spdlog::info("Address Library：{}。",
-		hasAddressLibrary ? "已找到" : "缺失（只影响可选的 GetDisplayFullName hook）");
-
+	// 执行顺序说明：下面两个字符串补丁是纯 Win32 操作，不需要 SKSE::Init，也不需要地址库。
+	// 所以采用“先补丁、后 Init”：即使没装 Address Library 也能正常汉化，
+	// 也避免“缺地址库时 Init 会终止游戏”牵连到主功能。
 	LoadConfig();
 	ResolveLanguage();
 	spdlog::set_level(g_cfg.logLevel);
@@ -759,6 +680,15 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 			patch_bytes::kAposExpected,
 			g_lang.aposReplacement,
 			g_lang.aposName);
+	}
+
+	// 两个核心补丁已完成。接下来：地址库就绪时才 Init（缺地址库时 Init 会终止游戏），
+	// Init 只影响下面可选的兜底 hook。
+	const bool hasAddressLibrary = !REL::Module::FindAddressLibrary().empty();
+	spdlog::info("Address Library：{}。",
+		hasAddressLibrary ? "已找到" : "缺失（只影响可选的 GetDisplayFullName hook）");
+	if (hasAddressLibrary) {
+		SKSE::Init(a_skse);
 	}
 
 	// 兜底 hook：GetDisplayFullName（ID 19354/19781）走 REL::Relocation，必须有地址库。
