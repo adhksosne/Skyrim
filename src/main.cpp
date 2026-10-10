@@ -63,18 +63,19 @@ namespace patch_bytes
 // ----------------------------------------------------------------------------------
 namespace
 {
-	constexpr std::array<std::pair<std::string_view, std::string_view>, 4> kLanguagePresets{ {
+	// 只处理非拉丁文字语言：它们的文字体系里本不该出现英文所有格。
+	// 拉丁文字语言（英/德/法…）用 's 或词尾 -s，视觉上都属正常，不处理。
+	constexpr std::array<std::pair<std::string_view, std::string_view>, 3> kLanguagePresets{ {
 		{ "zh", "\xE7\x9A\x84" },        // 的
 		{ "ja", "\xE3\x81\xAE" },        // の
 		{ "ko", "\xEC\x9C\x9C" },        // 의
-		{ "de", "'s " },                 // 德文保持英文所有格（仅作对照）
 	} };
 
 	constexpr std::string_view kDefaultLanguage = "zh";
 
 	struct Config
 	{
-		std::string language{ kDefaultLanguage };   // Language：zh / ja / ko / de
+		std::string language{ kDefaultLanguage };   // Language：zh / ja / ko
 		std::string customApos;                     // CustomAposReplacement：自定义 3 字节标记（覆盖预设）
 	};
 
@@ -209,7 +210,7 @@ void ResolveLanguage()
 		}
 	}
 	if (marker.empty()) {
-		spdlog::warn("未知 Language=\"{}\"（可用：zh / ja / ko / de），回退到 {}。",
+		spdlog::warn("未知 Language=\"{}\"（可用：zh / ja / ko），回退到 {}。",
 			g_cfg.language, kDefaultLanguage);
 		for (const auto& [key, value] : kLanguagePresets) {
 			if (key == kDefaultLanguage) {
