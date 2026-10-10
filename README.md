@@ -26,7 +26,7 @@
 | `Language` | `zh` | `zh`=的、`ja`=の、`ko`=의 |
 | `CustomAposReplacement` | （空） | 可选：自定义 **3 字节 UTF-8** 标记，覆盖 `Language` |
 
-整份 ini 删掉也能用（默认中文）。日志在
+日志在
 `文档\My Games\Skyrim Special Edition\SKSE\PossessiveLocalization.log`。
 
 ## 原理
@@ -57,7 +57,3 @@
 ## License
 
 MIT。
-
----
-
-*English: an SKSE plugin that replaces the engine's hardcoded possessive `'s` (`"%s's %s"`, `"'s "`) in owned-object display names with the target language's marker (zh 的 / ja の / ko 의). One DLL for SE / AE / VR; no ESP/ESM/Papyrus, no save edits, no Address Library needed. It locates the two literals inside the exe image and overwrites them in place; anything unexpected is logged and skipped.*
